@@ -1,0 +1,3 @@
+# bc.py uses only the Python standard library (Python 3.10+), so there are no runtime dependencies.
+# The tests use the standard unittest module. They also run under pytest (python -m pytest -q),
+# which is a development tool only.

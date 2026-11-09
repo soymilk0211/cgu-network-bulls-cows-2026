@@ -1,0 +1,14 @@
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# Game logs: server logs (--log-dir) and our client/ai logs. Never commit real game logs
+# unless the group decides to.
+logs/
+client_logs/
+*.log
+
+# Private course materials (spec PDF, reference server, self-test tool).
+# Keep them locally in course/ only. Never commit them.
+course/
