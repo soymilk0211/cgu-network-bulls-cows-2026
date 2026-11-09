@@ -8,6 +8,9 @@ __pycache__/
 logs/
 client_logs/
 *.log
+# tools/checkpoint1.py output (real client, AI and server logs) and self-test results.
+checkpoint1_out/
+selftest*.json
 
 # Private course materials (spec PDF, reference server, self-test tool).
 # Keep them locally in course/ only. Never commit them.
