@@ -34,8 +34,8 @@ python -m unittest discover -s tests -v  # standard library only
 |---|---|---|
 | 1. Constants and errors | `PROTOCOL_VERSION`, `MAX_LINE_BYTES = 4096`, `LineTooLong`, `BadJson` | §8.2, §13 |
 | 2. Framing | `LineBuffer` turns received bytes into whole lines, `decode` / `encode` convert between lines and dicts, `send_msg` sends with `sendall` | §8.2–8.3, §16.3 |
-| 3. Validators | `is_valid_number`, `is_int`, `is_valid_feedback`, `is_hex`, `LEGAL_FEEDBACK` | §9 |
-| 4. Game math | `ALL_NUMBERS`, `score`, `make_commit`, `verify_reveal`, `filter_candidates` | §2.2, §3.1, §14 |
+| 3. Validators | `is_valid_number`, `is_int`, `is_valid_feedback`, `is_hex`, `is_valid_text` (name/team/chat), `is_supported_protocol` (`BC/1.x`), `LEGAL_FEEDBACK` | §9, §16.2 |
+| 4. Game math | `ALL_NUMBERS`, `score`, `make_commit`, `verify_reveal` (NO_REVEAL / BAD_COMMIT / INCONSISTENT / OK), `filter_candidates` | §2.2, §3.1, §14 |
 | 5. Message helpers | `make_pong`, `dispatch`, which ignores unknown message types | §8.3.6, §11.1 |
 | 6. CLI | `build_parser` with the exact §5.2 options | §5.2 |
 

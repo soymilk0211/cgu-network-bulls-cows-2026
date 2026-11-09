@@ -47,7 +47,7 @@ class LineBufferTests(unittest.TestCase):
 
     def test_empty_lines_are_ignored(self):
         buf = bc.LineBuffer()
-        self.assertEqual(buf.feed(b'\n\r\n{"type":"PING"}\n\n'), [b'{"type":"PING"}'])
+        self.assertEqual(buf.feed(b'\n\r\n{"type":"PING"}\n\n  \t\r\n'), [b'{"type":"PING"}'])
 
     def test_exactly_4096_bytes_including_lf_is_accepted(self):
         line = line_of_exact_size(4096)
@@ -199,6 +199,23 @@ class ValidatorTests(unittest.TestCase):
         self.assertFalse(bc.is_commit(None))
 
 
+    def test_text_fields(self):  # name/team 1-20, CHAT 1-200, no control characters (§9)
+        self.assertTrue(bc.is_valid_text("G07-小明", 1, 20))
+        self.assertTrue(bc.is_valid_text("x" * 20, 1, 20))
+        self.assertFalse(bc.is_valid_text("x" * 21, 1, 20))
+        self.assertFalse(bc.is_valid_text("", 1, 20))
+        self.assertFalse(bc.is_valid_text("a\tb", 1, 20))  # Cc
+        self.assertFalse(bc.is_valid_text("a\u200bb", 1, 20))  # Cf (zero-width space)
+        self.assertFalse(bc.is_valid_text(None, 1, 20))
+        self.assertTrue(bc.is_valid_text("大家好", 1, 200))
+
+    def test_protocol_version(self):  # §9, §16.2
+        for good in ("BC/1.0", "BC/1.1", "BC/1.12"):
+            self.assertTrue(bc.is_supported_protocol(good), good)
+        for bad in ("BC/2.0", "BC/1", "bc/1.0", "BC/1.0 ", "BC/1.x", None, 1.0):
+            self.assertFalse(bc.is_supported_protocol(bad), repr(bad))
+
+
 class GameMathTests(unittest.TestCase):
     def test_commit_test_vector(self):  # §3.1
         self.assertEqual(
@@ -242,8 +259,16 @@ class GameMathTests(unittest.TestCase):
         commit = bc.commit_hash("0275", salt)
         self.assertEqual(bc.verify_reveal(commit, "0276", salt, []), ("BAD_COMMIT", []))
         self.assertEqual(bc.verify_reveal(commit, "0275", "0" * 32, []), ("BAD_COMMIT", []))
-        self.assertEqual(bc.verify_reveal(commit, "0275", "nonsense", []), ("BAD_COMMIT", []))
-        self.assertEqual(bc.verify_reveal(commit, "０２７５", salt, []), ("BAD_COMMIT", []))
+        # BAD_COMMIT is checked before the history: a lie does not change the verdict
+        self.assertEqual(bc.verify_reveal(commit, "0276", salt, [(1, "0276", 0, 0)]), ("BAD_COMMIT", []))
+
+    def test_verify_reveal_no_reveal(self):  # §14.2 step 1: no well-formed REVEAL
+        salt = "2eb6594c74b9b9d71e2d9b5bd14300df"
+        commit = bc.commit_hash("0275", salt)
+        self.assertEqual(bc.verify_reveal(commit, None, None, []), ("NO_REVEAL", []))
+        self.assertEqual(bc.verify_reveal(commit, "0275", "nonsense", []), ("NO_REVEAL", []))
+        self.assertEqual(bc.verify_reveal(commit, "０２７５", salt, []), ("NO_REVEAL", []))
+        self.assertEqual(bc.verify_reveal(None, None, None, [(1, "0123", 0, 0)]), ("NO_REVEAL", []))
 
     def test_verify_reveal_inconsistent(self):
         salt = "2eb6594c74b9b9d71e2d9b5bd14300df"

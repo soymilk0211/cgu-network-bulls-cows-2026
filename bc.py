@@ -25,6 +25,7 @@ import json
 import re
 import secrets
 import sys
+import unicodedata
 
 # =====================================================================
 # 1. Constants and errors
@@ -71,9 +72,9 @@ class LineBuffer:
         for line in buf.feed(sock.recv(4096)):
             msg = decode(line)
 
-    Rules (§8.2):
+    Rules (§8.3):
       * a message ends with LF (b"\\n"); one CR right before the LF is dropped;
-      * empty lines are ignored;
+      * empty lines (also lines of only spaces/tabs) are ignored;
       * a message may be at most MAX_LINE_BYTES bytes including the LF.
         If it is longer we raise LineTooLong.  We never keep more than
         MAX_LINE_BYTES bytes while waiting for an LF, so a peer that never
@@ -104,7 +105,7 @@ class LineBuffer:
             del self._buf[: end + 1]
             if line.endswith(b"\r"):
                 line = line[:-1]
-            if line:
+            if line.strip():  # skip empty / whitespace-only lines
                 lines.append(line)
         # No LF yet.  If we already hold max_bytes, the LF would make the
         # message at least max_bytes + 1 long, so it can never be valid.
@@ -167,6 +168,7 @@ def send_msg(sock, msg):
 
 _NUMBER_RE = re.compile(r"[0-9]{4}")  # [0-9] = ASCII digits only, unlike \d
 _HEX_RE = re.compile(r"[0-9a-f]+")  # lowercase hex only
+_PROTOCOL_RE = re.compile(r"BC/1\.[0-9]+")  # any BC/1.x is compatible (§9, §16.2)
 
 # The 14 possible answers (a, b): a + b <= 4, and 3A1B is impossible because
 # if 3 digits are in the right place the 4th cannot be a "B" (§2.2).
@@ -209,6 +211,22 @@ def is_salt(s):
     return is_hex(s, 32)
 
 
+def is_valid_text(s, min_len, max_len):
+    """A str of min_len..max_len characters with no control characters.
+
+    Used for name and team (1-20) and CHAT text (1-200).  "Control
+    character" means any Unicode category starting with C: Cc, Cf, Cs,
+    Co, Cn (§9).  Length is counted in characters, not bytes.
+    """
+    return (isinstance(s, str) and min_len <= len(s) <= max_len
+            and not any(unicodedata.category(ch).startswith("C") for ch in s))
+
+
+def is_supported_protocol(s):
+    """True for any "BC/1.x" version string; major version 1 is what we speak."""
+    return isinstance(s, str) and _PROTOCOL_RE.fullmatch(s) is not None
+
+
 # =====================================================================
 # 4. Game math                                          §2.2, §3.1, §14
 # =====================================================================
@@ -247,14 +265,15 @@ def verify_reveal(commit, secret, salt, history):
     """Check a revealed secret against its commit and past feedback (§14.2).
 
     history: list of (turn_id, guess, a, b) - the feedback this player gave.
-    Returns (verdict, bad_turns):
-      ("BAD_COMMIT", [])      secret/salt malformed or hash != commit
+    Pass secret=None, salt=None if no valid REVEAL arrived in time.
+    Returns (verdict, bad_turns), checked in the order of §14.2:
+      ("NO_REVEAL", [])       no well-formed secret + salt
+      ("BAD_COMMIT", [])      SHA256(secret:salt) != commit
       ("INCONSISTENT", [ids]) hash ok, but feedback for these turns was wrong
       ("OK", [])              everything matches
-    NO_REVEAL (player never revealed) is decided by the caller on timeout.
     """
     if not (is_valid_number(secret) and is_salt(salt)):
-        return "BAD_COMMIT", []
+        return "NO_REVEAL", []
     if commit_hash(secret, salt) != commit:
         return "BAD_COMMIT", []
     bad_turns = [turn_id for turn_id, guess, a, b in history if score(guess, secret) != (a, b)]
