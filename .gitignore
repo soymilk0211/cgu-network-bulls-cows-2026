@@ -11,6 +11,8 @@ client_logs/
 # tools/checkpoint1.py output (real client, AI and server logs) and self-test results.
 checkpoint1_out/
 selftest*.json
+# tools/ai_experiment.py output (the README keeps the summary table).
+ai_experiment_out/
 
 # Private course materials (spec PDF, reference server, self-test tool).
 # Keep them locally in course/ only. Never commit them.

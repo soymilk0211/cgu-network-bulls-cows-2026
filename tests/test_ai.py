@@ -1,7 +1,10 @@
-"""Tests for the AI player (issue #3): inference, v1 strategy, timing, protocol."""
+"""Tests for the AI player (issues #3, #11): inference, v1/v2 strategies, timing, protocol."""
 
+import contextlib
+import io
 import random
 import shutil
+import subprocess
 import sys
 import tempfile
 import threading
@@ -15,6 +18,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import bc  # noqa: E402
 from test_client import PLAYERS, RULES, SALT2, FakeServer, wait_for  # noqa: E402
+from test_server import ServerThread  # noqa: E402
 
 
 def turn_result(turn_id, guesser, guess, results, eliminated=()):
@@ -150,8 +154,130 @@ class StrategyTests(unittest.TestCase):
         self.assertLess(sum(counts) / len(counts), 6.0)
 
 
+def weighted_score(guess, cands, target):
+    """v2's score of a guess, computed exactly (for lists no bigger than AI_V2_SAMPLE)."""
+    value = bc.answer_entropy(guess, cands[target])
+    return value + bc.AI_V2_WEIGHT * sum(bc.answer_entropy(guess, c)
+                                         for pid, c in cands.items() if pid != target and c)
+
+
+class V2StrategyTests(unittest.TestCase):
+    def test_answer_entropy(self):
+        self.assertEqual(bc.answer_entropy("0123", ["0123"]), 0.0)
+        self.assertAlmostEqual(bc.answer_entropy("0123", ["0123", "4567"]), 1.0)
+        # answers 0A0B, 0A0B, 3A0B, 3A0B: two equal groups = 1 bit
+        self.assertAlmostEqual(bc.answer_entropy("0123", ["4567", "5678", "0124", "0125"]), 1.0)
+        # answers 4A0B, 2A2B, 0A0B, 0A4B: four groups of one = 2 bits
+        self.assertAlmostEqual(bc.answer_entropy("0123", ["0123", "0132", "4567", "1032"]), 2.0)
+
+    def test_known_secret_is_guessed_at_once(self):
+        cands = {"p2": list(bc.ALL_NUMBERS), "p3": ["5079"], "p4": ["0123", "4567"]}
+        self.assertEqual(bc.choose_guess_v2(cands), "5079")
+
+    def test_guess_is_always_legal(self):
+        rng = random.Random(4)
+        for sizes in ((1,), (2,), (3, 5040), (10, 0, 40), (200, 900), (2000, 3000, 4000), (5040, 5040)):
+            cands = {f"p{i + 2}": rng.sample(bc.ALL_NUMBERS, n) for i, n in enumerate(sizes)}
+            guess = bc.choose_guess_v2(cands, budget=0.5, rng=rng)
+            self.assertTrue(bc.is_valid_number(guess), sizes)
+        self.assertTrue(bc.is_valid_number(bc.choose_guess_v2({})))  # nobody left: random
+        self.assertTrue(bc.is_valid_number(bc.choose_guess_v2({"p2": []})))  # only a liar left
+
+    def test_choice_uses_every_opponents_candidates(self):
+        # Small lists, so v2 scores exactly: its guess must be at least as good as every
+        # candidate of the target and of the other opponent (all of them are in the pool).
+        target = bc.filter_candidates(bc.ALL_NUMBERS, "0123", 1, 1)
+        target = bc.filter_candidates(bc.filter_candidates(target, "4567", 1, 0), "8901", 0, 2)  # 44
+        other = bc.filter_candidates(bc.filter_candidates(bc.ALL_NUMBERS, "0123", 0, 2), "4567", 1, 1)
+        other = other[:bc.AI_V2_EXTRA]  # 75 of 168, so all of them are in the pool
+        self.assertLess(len(target), len(other))
+        self.assertLessEqual(len(target), bc.AI_V2_POOL)
+        cands = {"p2": target, "p3": other}
+        guess = bc.choose_guess_v2(cands, budget=5.0, rng=random.Random(1))
+        best = max(weighted_score(g, cands, "p2") for g in target + other)
+        self.assertGreaterEqual(weighted_score(guess, cands, "p2"), best - 1e-9)
+
+    def test_worst_case_decisions_are_fast(self):
+        # After one public answer: up to 5 opponents with the biggest lists (1440, 1260, ...).
+        answers = ((0, 1), (0, 2), (1, 1), (1, 0))
+        big = [bc.filter_candidates(bc.ALL_NUMBERS, "0123", a, b) for a, b in answers]
+        for opponents in (1, 3, 5):
+            cands = {f"p{i + 2}": big[i % len(big)] for i in range(opponents)}
+            start = time.monotonic()
+            guess = bc.choose_guess_v2(cands)
+            self.assertLess(time.monotonic() - start, 1.5, f"{opponents} opponents")
+            self.assertTrue(bc.is_valid_number(guess))
+        start = time.monotonic()
+        bc.choose_guess_v2({f"p{i}": list(bc.ALL_NUMBERS) for i in range(2, 7)})  # cold: all full
+        self.assertLess(time.monotonic() - start, 0.1)
+
+    def test_timeout_falls_back_to_v1(self):
+        cands = {"p2": bc.filter_candidates(bc.ALL_NUMBERS, "0123", 0, 1), "p3": list(bc.ALL_NUMBERS)}
+        stats = {}
+        start = time.monotonic()
+        guess = bc.choose_guess_v2(cands, budget=0.0, stats=stats)
+        self.assertLess(time.monotonic() - start, 0.5)
+        self.assertTrue(stats.get("fallback"))
+        self.assertIn(guess, cands["p2"])  # v1 always guesses a target candidate
+        stats = {}
+        bc.choose_guess_v2(cands, budget=5.0, stats=stats)
+        self.assertNotIn("fallback", stats)
+
+    def test_v2_solves_single_opponent_games(self):
+        rng = random.Random(2027)
+        counts = []
+        for _ in range(25):
+            secret = rng.choice(bc.ALL_NUMBERS)
+            cands = list(bc.ALL_NUMBERS)
+            for n in range(1, 11):
+                guess = bc.choose_guess_v2({"p2": cands}, budget=0.5, rng=rng)
+                a, b = bc.score(guess, secret)
+                if (a, b) == (4, 0):
+                    counts.append(n)
+                    break
+                cands = bc.filter_candidates(cands, guess, a, b)
+                self.assertIn(secret, cands)
+        self.assertEqual(len(counts), 25)
+        self.assertLessEqual(max(counts), 8)
+        self.assertLess(sum(counts) / len(counts), 6.0)
+
+    def test_strategy_names(self):
+        self.assertEqual(bc.AI_STRATEGIES, ("v1", "v2"))
+        self.assertIn(bc.DEFAULT_STRATEGY, bc.AI_STRATEGIES)
+        with self.assertRaises(ValueError):
+            bc.AIPlayer("127.0.0.1", 1, "x", "T", strategy="v3")
+        with self.assertRaises(SystemExit), contextlib.redirect_stderr(io.StringIO()):
+            bc.build_parser().parse_args(["ai", "--host", "h", "--name", "n", "--strategy", "v3"])
+
+
+class StrategiesAgainstOurServerTest(unittest.TestCase):
+    """`bc.py ai --strategy v1` and `--strategy v2` play a whole game against our server."""
+
+    def test_v1_and_v2_finish_a_game(self):
+        server = ServerThread("--players", "2", "--guess-timeout", "5", "--feedback-timeout", "5")
+        self.addCleanup(server.stop)
+        work = tempfile.mkdtemp(prefix="bc-ai-proc-")
+        self.addCleanup(shutil.rmtree, work, True)
+        procs = {}
+        for strategy in ("v1", "v2"):
+            procs[strategy] = subprocess.Popen(
+                [sys.executable, str(ROOT / "bc.py"), "ai", "--host", "127.0.0.1", "--port", str(server.port),
+                 "--name", f"AI-{strategy}", "--team", "T", "--strategy", strategy],
+                cwd=work, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, encoding="utf-8")
+        outputs = {s: p.communicate(timeout=120)[0] for s, p in procs.items()}
+        for strategy, proc in procs.items():
+            self.assertEqual(proc.returncode, 0, outputs[strategy])
+            self.assertIn(f"({strategy}, took", outputs[strategy])  # the option reached the player
+            self.assertIn("GAME OVER", outputs[strategy])
+        wait_for(lambda: not server.thread.is_alive(), timeout=10, what="server exit after --games 1")
+        over = [r["msg"] for r in server.log_records() if r["msg"]["type"] == "GAME_OVER"]
+        self.assertEqual(over[0]["reason"], "LAST_PLAYER")
+
+
 class AIProtocolTest(unittest.TestCase):
     """The AI against a scripted fake server: everything must be automatic."""
+
+    strategy = "v2"
 
     def setUp(self):
         self.server = FakeServer()
@@ -160,7 +286,7 @@ class AIProtocolTest(unittest.TestCase):
         self.addCleanup(shutil.rmtree, self.log_dir, True)
         self.out = []
         self.ai = bc.AIPlayer("127.0.0.1", self.server.port, "G00-AI", "G00", out=self.out.append,
-                              log_dir=self.log_dir, quiet=True)
+                              log_dir=self.log_dir, quiet=True, strategy=self.strategy)
         self.exit_code = []
         self.thread = threading.Thread(target=lambda: self.exit_code.append(self.ai.run()), daemon=True)
         self.thread.start()
@@ -239,6 +365,12 @@ class AIProtocolTest(unittest.TestCase):
         self.assertEqual(reveal["secret"], secret)
         self.assertEqual(bc.commit_hash(secret, reveal["salt"]), commit)
         self.assertTrue(self.ai.out_of_game)
+
+
+class AIProtocolTestV1(AIProtocolTest):
+    """The same protocol tests with --strategy v1."""
+
+    strategy = "v1"
 
 
 if __name__ == "__main__":

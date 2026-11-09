@@ -58,24 +58,55 @@ Exit code: 0 after a normal `GAME_OVER`, 1 after a fatal `ERROR` or a lost conne
 ## AI player
 
 ```
-python bc.py ai --host 127.0.0.1 --port 5040 --name G00-AI --team G00 [--quiet]
+python bc.py ai --host 127.0.0.1 --port 5040 --name G00-AI --team G00 [--quiet] [--strategy v1|v2]
 ```
 
 The AI plays without any input. It picks a random secret with `secrets` and sends the commit. Feedback is
 always the honest answer, sent at once, and reveals are immediate. It answers `PING` and ignores unknown
 messages. `--quiet` prints only errors and the final result. Like the client, it logs to `client_logs/`.
+`--strategy` picks how it chooses guesses: `v2` (the default) or `v1`. The server's `--bots` use the default.
 
-**How it thinks (v1, the spec's baseline, §5.5).** For every opponent still in the game the AI keeps the list
-of secrets that are still possible. It starts with all 5040. Every `TURN_RESULT` shrinks these lists, not only
-the results of our own guesses. On our turn:
+**What both strategies share.** For every opponent still in the game the AI keeps the list of secrets that are
+still possible. It starts with all 5040. Every `TURN_RESULT` shrinks these lists, not only the results of our
+own guesses. The **target** is the opponent with the fewest possible secrets left. A decision may use at most
+1 s (or a quarter of the guess timeout), far below the spec's 2 s.
 
-1. **Target:** the opponent with the fewest possible secrets left.
-2. **Guess:** the target's possible secret that splits its list into the most different answers (`aAbB`).
-   This is Kooi's "most parts" rule. Big lists are estimated on a random sample of 500. The search stops after
-   1 s (or a quarter of the guess timeout), and it stops at once if a guess reaches the maximum of 14 parts.
+**v1, the spec's baseline (§5.5).** Guess the target's possible secret that splits its list into the most
+different answers (`aAbB`). This is Kooi's "most parts" rule. Big lists are estimated on a random sample of
+500, and the search stops at once if a guess reaches the maximum of 14 parts.
 
-Offline, against one opponent, v1 needed 5.26 guesses on average and at most 7 (300 random secrets). The
-slowest decision took 0.17 s.
+**v2, weighted multi-opponent entropy (#11).** Every alive opponent answers every guess, so one guess can
+teach us about everybody. v2 gives each guess the score `H(target) + 0.5 × ΣH(other opponents)`. `H` is the
+entropy (in bits) of the answers an opponent could give: the higher it is, the fewer secrets stay possible on
+average. The guesses it scores are the target's possible secrets (only these can hit the target, and they win
+ties), some possible secrets of each other opponent, and some random numbers. If the target has one possible
+secret left, v2 guesses it at once. Lists are estimated on samples of 200. If the scoring does not finish in
+60 % of the time budget, v1 decides with the rest of the time.
+
+**Experiment.** `tools/ai_experiment.py` plays simulated games with `bc.py`'s own code (same scoring,
+candidate lists and ranking as the server) and writes `results.csv` and `results.md` to
+`ai_experiment_out/`. One "hero" uses the strategy under test; the opponents play v1. With the hero on v1
+all players are equal, so v1's rows are the control (about 50 % in 2p and 25 % in 4p).
+
+```
+python3 tools/ai_experiment.py                 # 100 games per setup and strategy (about 1 minute)
+python3 tools/ai_experiment.py --games 300     # the table below
+```
+
+| setup (300 games each, Python 3.10) | strategy | win rate | avg guesses (hero) | max guesses | avg decision | max decision |
+|---|---|---:|---:|---:|---:|---:|
+| solo: break one secret | v1 | - | 5.31 | 7 | 6.5 ms | 201 ms |
+| solo: break one secret | v2 | - | 5.26 | 7 | 11.1 ms | 51 ms |
+| 2p: hero vs 1 × v1 | v1 | 48.7 % | 4.57 | 6 | 9.1 ms | 204 ms |
+| 2p: hero vs 1 × v1 | v2 | 60.0 % | 4.67 | 6 | 12.3 ms | 54 ms |
+| 4p: hero vs 3 × v1 | v1 | 21.7 % | 2.35 | 5 | 6.3 ms | 221 ms |
+| 4p: hero vs 3 × v1 | v2 | **32.7 %** | 2.46 | 5 | 44.1 ms | 234 ms |
+
+No v2 decision ran out of time. The 4-player gain is real: 1000 more games with another seed gave v2
+32.3 % against a control of 21.3 %. The 2-player figure is partly luck: 2 × 1000 more games with other seeds
+gave v2 53.5 % and 52.1 % (controls 47.5 % and 51.0 %), which matches what the solo guess counts predict.
+So v2 is the default: clearly better with several opponents, about as good with one, and every decision far
+below 2 s.
 
 ## Hosting (server)
 
@@ -168,7 +199,7 @@ python -m unittest discover -s tests -v  # standard library only
 | 6. Client log | `JsonlLog`: own log in the server's record format, written to `client_logs/` | §5.6 |
 | 7. Player session | `PlayerSession`: connection, reader thread, main event loop, public game state (history, candidates per opponent), automatic COMMIT/REVEAL/PONG, local reveal check. Shared by client and AI | §11–12, §16.3 |
 | 8. Human client | `HumanClient`: input thread, prompts with deadlines, prefilled feedback plus confirmation | §5.4 |
-| 9. AI | `pick_target`, `most_parts_guess`, `choose_guess_v1`, `AIPlayer` | §5.5 |
+| 9. AI | `pick_target`, `most_parts_guess`, `choose_guess_v1` (v1); `answer_entropy`, `entropy_guess`, `choose_guess_v2` (v2); `AIPlayer` | §5.5 |
 | 10. Server | `GameServer` (lobby, state machine, timeouts, reveals, ranking, bots, logs), `Connection` (bounded send queue), `ServerPlayer`, `hello_error`, `compute_ranking` | §5.3, §10–§14, §16.1 |
 | 11. CLI | `build_parser` with the exact §5.2 options; `server_arg_problems` | §5.2 |
 
