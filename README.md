@@ -18,8 +18,42 @@ python bc.py ai     --host HOST [--port 5040] --name NAME [--team G00] [--quiet]
 `python bc.py <subcommand> --help` lists every option with its default. Timeouts are in seconds and may be
 fractional (for example `--guess-timeout 1.5`).
 
-Status: the shared protocol layer and the command-line interface are done (issue #1). The `client` (#2),
-`ai` (#3) and `server` (#4) modes are still to come.
+Status: the shared protocol layer and CLI (#1) and the human `client` (#2) are done. The `ai` (#3) and
+`server` (#4) modes are still to come.
+
+## How to play (client)
+
+```
+python bc.py client --host 127.0.0.1 --port 5040 --name G00-小明 --team G00
+```
+
+`--name` and `--team` must be 1–20 characters with no control characters. For the class games, start the
+name with your group code, for example `G07-小明`. The client only asks you something when you have to act.
+Each question starts with `?` and shows the seconds left:
+
+| When | You type | What the client does |
+|---|---|---|
+| Game starts | your secret (4 different digits, e.g. `0275`) or just Enter for a random one | sends the **commit** (hash) automatically; the salt stays in memory. If you do not answer in time, a random secret is used |
+| Your turn (`TURN` with you as guesser) | your guess, e.g. `0927` | checks the format locally, sends exactly one `GUESS` |
+| Someone else guessed | Enter | the answer for your secret is **prefilled** (e.g. `1A2B`); Enter sends it |
+| … or another answer, e.g. `2A0B` / `2 0` | a changed answer must be confirmed with `yes` (a wrong answer gets you disqualified at the reveal) |
+| Reveal requested | nothing | the secret and salt are sent **automatically and immediately** |
+
+**A missing feedback = FORFEIT.** A missed guess only skips your turn (after `max_skips` skips in a row you
+forfeit too). When the time is up the question is withdrawn and late input is not sent.
+
+While you think, the client keeps showing new messages (turn results, chat, lobby) and answers `PING`
+automatically. You see every turn's results, eliminations, every reveal verdict and the final ranking. Each
+reveal is re-checked locally, and `[!] our own check says …` appears if it disagrees with the server. After
+you are out you keep watching as a spectator.
+
+Commands at any time: `/chat TEXT`, `/cands` (possible secrets left per opponent), `/quit`, `/help`.
+
+The client writes its own JSON Lines log (`ts`, `dir`, `peer`, `msg`) to `client_logs/` in the current
+folder. That folder is separate from the server's `--log-dir` and ignored by git.
+
+Exit code: 0 after a normal `GAME_OVER`, 1 after a fatal `ERROR` or a lost connection, 2 for a bad
+`--name`/`--team`.
 
 ## Tests
 
@@ -37,7 +71,10 @@ python -m unittest discover -s tests -v  # standard library only
 | 3. Validators | `is_valid_number`, `is_int`, `is_valid_feedback`, `is_hex`, `is_valid_text` (name/team/chat), `is_supported_protocol` (`BC/1.x`), `LEGAL_FEEDBACK` | §9, §16.2 |
 | 4. Game math | `ALL_NUMBERS`, `score`, `make_commit`, `verify_reveal` (NO_REVEAL / BAD_COMMIT / INCONSISTENT / OK), `filter_candidates` | §2.2, §3.1, §14 |
 | 5. Message helpers | `make_pong`, `dispatch`, which ignores unknown message types | §8.3.6, §11.1 |
-| 6. CLI | `build_parser` with the exact §5.2 options | §5.2 |
+| 6. Client log | `JsonlLog`: own log in the server's record format, written to `client_logs/` | §5.6 |
+| 7. Player session | `PlayerSession`: connection, reader thread, main event loop, public game state (history, candidates per opponent), automatic COMMIT/REVEAL/PONG, local reveal check. Shared by client and AI | §11–12, §16.3 |
+| 8. Human client | `HumanClient`: input thread, prompts with deadlines, prefilled feedback plus confirmation | §5.4 |
+| 9. CLI | `build_parser` with the exact §5.2 options | §5.2 |
 
 ## Course materials
 

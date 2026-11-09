@@ -15,17 +15,26 @@ Layout of this file (search for the "=====" banners):
     3. Field validators                     (§9)
     4. Game math: score, commit, reveal     (§2.2, §3.1, §14)
     5. Message helpers: PING/PONG, dispatch (§8.3.6, §11.1)
-    6. Command line interface               (§5.2)
+    6. Client-side JSON Lines log           (§5.6)
+    7. PlayerSession: connection + game state shared by client and AI (§11-12)
+    8. HumanClient: console player          (§5.4)
+    9. Command line interface               (§5.2)
 """
 
 import argparse
 import hashlib
 import itertools
 import json
+import os
+import queue
 import re
 import secrets
+import socket
 import sys
+import threading
+import time
 import unicodedata
+from dataclasses import dataclass, field
 
 # =====================================================================
 # 1. Constants and errors
@@ -314,7 +323,684 @@ def dispatch(handlers, msg):
 
 
 # =====================================================================
-# 6. Command line interface                                      §5.2
+# 6. Client-side JSON Lines log                                  §5.6
+# =====================================================================
+#
+# Our client and AI keep their own log in the same record format as the
+# server log.  It goes to CLIENT_LOG_DIR, never into the server's --log-dir.
+
+CLIENT_LOG_DIR = "client_logs"
+
+
+class JsonlLog:
+    """One {"ts", "dir", "peer", "msg"} JSON record per line, flushed at once.
+
+    Both the reader thread and the main thread write to it, so a lock keeps
+    the lines from mixing.  A failing disk must never stop the game, so
+    write errors are ignored.
+    """
+
+    def __init__(self, path):
+        self.path = path
+        self._lock = threading.Lock()
+        try:
+            folder = os.path.dirname(path)
+            if folder:
+                os.makedirs(folder, exist_ok=True)
+            self._file = open(path, "a", encoding="utf-8")
+        except OSError as exc:
+            print(f"[warning] cannot write the log file {path}: {exc}")
+            self._file = None
+
+    def write(self, direction, peer, msg):
+        if self._file is None:
+            return
+        record = {"ts": round(time.time(), 3), "dir": direction, "peer": peer, "msg": msg}
+        line = json.dumps(record, ensure_ascii=False) + "\n"
+        with self._lock:
+            try:
+                self._file.write(line)
+                self._file.flush()
+            except (OSError, ValueError):
+                pass
+
+    def close(self):
+        with self._lock:
+            if self._file is not None:
+                self._file.close()
+
+
+def client_log_path(kind, name, log_dir=CLIENT_LOG_DIR):
+    """client_logs/20261110-143000-human-G00-小明-12345.jsonl (unique per run)."""
+    safe_name = re.sub(r"[^\w-]+", "_", name)[:20] or "player"
+    stamp = time.strftime("%Y%m%d-%H%M%S")
+    return os.path.join(log_dir, f"{stamp}-{kind}-{safe_name}-{os.getpid()}.jsonl")
+
+
+def printable(value, limit=200):
+    """Text from the network, made safe to print: no control characters.
+
+    A bad server could put terminal escape codes into a name or a chat line.
+    """
+    text = str(value)[:limit]
+    return "".join("?" if unicodedata.category(ch).startswith("C") else ch for ch in text)
+
+
+# =====================================================================
+# 7. Player session: shared by the human client and the AI     §11-12
+# =====================================================================
+
+SOFTWARE = "cgu-bc/0.2"
+DEFAULT_RULES = {"guess_timeout": 60, "feedback_timeout": 60, "commit_timeout": 30,
+                 "reveal_timeout": 15, "max_turns": 120, "max_skips": 3}
+
+
+def read_rules(rules):
+    """Take the rules from GAME_START, falling back to defaults for bad values."""
+    result = dict(DEFAULT_RULES)
+    if isinstance(rules, dict):
+        for key in result:
+            value = rules.get(key)
+            if isinstance(value, (int, float)) and not isinstance(value, bool) and value > 0:
+                result[key] = value
+    return result
+
+
+def answer_deadline(timeout, margin=1.0):
+    """When to stop waiting for our own answer, measured from now.
+
+    The server's timer starts when it sends the message, and the network
+    adds delay, so we aim to answer `margin` seconds early (§12).  For very
+    short timeouts we keep at least half of the time.
+    """
+    return time.monotonic() + max(timeout - margin, timeout / 2)
+
+
+class PlayerSession:
+    """One connection to a BC/1.0 server as a player.
+
+    It does the networking and keeps the public game state.  The human
+    client (HumanClient) and the AI (AIPlayer) are subclasses.  They differ
+    only in three hooks: begin_commit, begin_guess, begin_feedback.
+
+    Threads:
+      * reader thread: recv() -> LineBuffer -> decode -> self.events queue
+      * input thread (human only): stdin lines -> self.events queue
+      * main thread, run(): handles one event at a time, updates the state
+        and does ALL the sending.  PING is answered here at once, because
+        the main thread never waits for the keyboard.
+    """
+
+    kind = "human"
+    TICK = 0.2  # seconds; how often run() checks deadlines when nothing happens
+
+    def __init__(self, host, port, name, team, out=print, log_dir=CLIENT_LOG_DIR):
+        self.host, self.port, self.name, self.team = host, port, name, team
+        self.peer = f"{host}:{port}"
+        self.out = out
+        self.log = JsonlLog(client_log_path(self.kind, name, log_dir))
+        self.events = queue.Queue()
+        self.sock = None
+        self.done = False  # True -> run() stops
+        self.game_over = False  # True once GAME_OVER arrived (normal end)
+        self.handlers = {
+            "WELCOME": self.on_welcome, "LOBBY": self.on_lobby,
+            "GAME_START": self.on_game_start, "COMMITS": self.on_commits,
+            "TURN": self.on_turn, "GUESS_MADE": self.on_guess_made,
+            "TURN_RESULT": self.on_turn_result, "REVEAL_REQUEST": self.on_reveal_request,
+            "REVEALED": self.on_revealed, "GAME_OVER": self.on_game_over,
+            "ERROR": self.on_error, "PING": self.on_ping, "CHAT": self.on_chat,
+        }  # any other type (PONG, future types) is ignored (§8.3.6)
+        self.me = None  # our player_id, from WELCOME
+        self.players = {}  # player_id -> {"id", "name", "team", "kind"}
+        self.reset_game()
+
+    def reset_game(self):
+        self.game_id = None
+        self.rules = dict(DEFAULT_RULES)
+        self.order = []  # turn order (from COMMITS: only real participants)
+        self.alive = []  # players still in the game
+        self.commits = {}  # player_id -> commit
+        self.history = {}  # player_id -> [(turn_id, guess, a, b)], public feedback
+        self.cands = {}  # opponent player_id -> list of still-possible secrets
+        self.secret = None
+        self.salt = None  # stays in memory only; sent only in REVEAL
+        self.out_of_game = False  # eliminated / forfeited / DQ -> spectator
+
+    # ----- output -------------------------------------------------------
+
+    def say(self, text):
+        self.out(text)
+
+    def label(self, pid):
+        """'p2(阿明)' for display; our own id gets ', you'."""
+        info = self.players.get(pid)
+        name = printable(info.get("name"), 20) if isinstance(info, dict) else "?"
+        you = ", you" if pid == self.me else ""
+        return f"{printable(pid, 20)}({name}{you})"
+
+    def labels(self, pids):
+        return ", ".join(self.label(p) for p in pids) or "-"
+
+    # ----- network ------------------------------------------------------
+
+    def connect(self):
+        self.sock = socket.create_connection((self.host, self.port), timeout=10)
+        self.sock.settimeout(None)  # from now on the reader thread blocks in recv()
+        threading.Thread(target=self._reader, name="net-reader", daemon=True).start()
+        self.send({"type": "HELLO", "protocol": PROTOCOL_VERSION, "name": self.name,
+                   "team": self.team, "kind": self.kind, "software": SOFTWARE})
+
+    def send(self, msg):
+        """Send one message (main thread only).  Returns False if the link is gone."""
+        if self.sock is None:
+            return False
+        try:
+            send_msg(self.sock, msg)
+        except OSError as exc:
+            self.say(f"[network] sending failed: {exc}")
+            self.done = True
+            return False
+        self.log.write("send", self.peer, msg)
+        return True
+
+    def _reader(self):
+        """Reader thread: turn the byte stream into events for the main thread."""
+        buf = LineBuffer()
+        reason = "the server closed the connection"
+        try:
+            while True:
+                data = self.sock.recv(65536)
+                if not data:
+                    break
+                try:
+                    lines, too_long = buf.feed(data), False
+                except LineTooLong as exc:
+                    lines, too_long = exc.complete, True
+                for line in lines:
+                    try:
+                        msg = decode(line)
+                    except BadJson:
+                        raw = line.decode("utf-8", "replace")
+                        self.log.write("recv", self.peer, {"raw": raw})
+                        self.events.put(("bad", raw))
+                        continue
+                    self.log.write("recv", self.peer, msg)
+                    self.events.put(("msg", msg))
+                if too_long:
+                    self.log.write("recv", self.peer, {"raw": "(line longer than 4096 bytes)"})
+                    self.events.put(("bad", "(line longer than 4096 bytes)"))
+        except OSError as exc:
+            reason = f"connection error: {exc}"
+        self.events.put(("closed", reason))
+
+    def close(self):
+        if self.sock is not None:
+            try:
+                self.sock.close()
+            except OSError:
+                pass
+            self.sock = None
+        self.log.close()
+
+    # ----- main loop ----------------------------------------------------
+
+    def run(self):
+        """Play one game.  Returns 0 after a normal GAME_OVER, else 1."""
+        try:
+            self.connect()
+        except OSError as exc:
+            self.say(f"Cannot connect to {self.peer}: {exc}")
+            self.close()
+            return 1
+        self.say(f"Connected to {self.peer} as {self.name!r} (team {self.team}). "
+                 f"Log file: {self.log.path}")
+        self.start_input()
+        try:
+            while not self.done:
+                try:
+                    kind, data = self.events.get(timeout=self.TICK)
+                except queue.Empty:
+                    kind, data = "tick", None
+                self.handle_event(kind, data)
+                self.check_deadlines()
+        except KeyboardInterrupt:
+            self.say("\nInterrupted - leaving the game.")
+            self.send({"type": "BYE"})
+        finally:
+            self.close()
+        return 0 if self.game_over else 1
+
+    def handle_event(self, kind, data):
+        if kind == "msg":
+            self.handle_message(data)
+        elif kind == "bad":
+            self.say(f"[warning] ignored an unparsable line from the server: {printable(data, 80)}")
+        elif kind == "closed":
+            if not self.game_over:
+                self.say(f"[network] {data} before the game ended. Exiting.")
+            self.done = True
+        elif kind == "input":
+            self.handle_input(data)
+
+    def handle_message(self, msg):
+        """Run the handler for msg["type"]; unknown types are ignored (§8.3.6).
+
+        A message from a buggy server with missing or wrongly typed fields
+        is reported and skipped instead of crashing the client.
+        """
+        try:
+            dispatch(self.handlers, msg)
+        except (KeyError, TypeError, ValueError, AttributeError, IndexError) as exc:
+            self.say(f"[warning] ignored a malformed {printable(msg.get('type'), 30)} "
+                     f"message ({type(exc).__name__}: {printable(exc, 80)})")
+
+    # ----- hooks for subclasses -----------------------------------------
+
+    def start_input(self):
+        """Start reading the keyboard (human only)."""
+
+    def handle_input(self, text):
+        """A line typed by the user (human only)."""
+
+    def check_deadlines(self):
+        """Called after every event and every TICK seconds (human only)."""
+
+    def withdraw_prompt(self, reason=None):
+        """Cancel a question we are asking the user (human only)."""
+
+    def begin_commit(self):
+        raise NotImplementedError
+
+    def begin_guess(self, turn_id):
+        raise NotImplementedError
+
+    def begin_feedback(self, turn_id, guesser, guess):
+        raise NotImplementedError
+
+    # ----- actions shared by human and AI -------------------------------
+
+    def send_commit(self, secret):
+        """Lock in our secret: send only the hash; keep secret and salt (§3.1)."""
+        self.secret = secret
+        self.salt, commit = make_commit(secret)
+        self.send({"type": "COMMIT", "commit": commit})
+
+    def send_guess(self, turn_id, guess):
+        self.send({"type": "GUESS", "turn_id": turn_id, "guess": guess})
+
+    def send_feedback(self, turn_id, a, b):
+        self.send({"type": "FEEDBACK", "turn_id": turn_id, "a": a, "b": b})
+
+    # ----- message handlers ---------------------------------------------
+
+    def on_welcome(self, msg):
+        self.me = msg["player_id"]
+        proto = msg.get("protocol")
+        if not is_supported_protocol(proto):
+            if isinstance(proto, str) and proto.startswith("BC/") and not proto.startswith("BC/1."):
+                self.say(f"The server speaks {printable(proto, 20)}, we speak BC/1.x. Leaving.")
+                self.send({"type": "BYE"})
+                self.done = True
+                return
+            self.say(f"[warning] unexpected protocol string {printable(proto, 20)!r}; continuing.")
+        self.say(f"Joined the lobby. Our player id is {self.me}.")
+
+    def on_lobby(self, msg):
+        players = msg["players"]
+        self.players = {p["id"]: p for p in players}
+        self.say(f"[lobby] {len(players)}/{msg.get('max_players', '?')} players: "
+                 f"{self.labels(p['id'] for p in players)}")
+
+    def on_game_start(self, msg):
+        self.reset_game()
+        self.game_id = msg.get("game_id")
+        self.players.update({p["id"]: p for p in msg["players"]})
+        self.order = list(msg["order"])
+        self.rules = read_rules(msg.get("rules"))
+        r = self.rules
+        self.say(f"\n=== Game {printable(self.game_id, 64)} starts. Turn order: "
+                 f"{' -> '.join(self.label(p) for p in self.order)}")
+        self.say(f"    time limits: guess {r['guess_timeout']}s, feedback {r['feedback_timeout']}s, "
+                 f"commit {r['commit_timeout']}s; max {r['max_turns']} turns")
+        self.begin_commit()
+
+    def on_commits(self, msg):
+        self.withdraw_prompt()
+        self.order = list(msg["order"])
+        self.commits = dict(msg["commits"])
+        self.alive = list(self.order)
+        self.history = {pid: [] for pid in self.order}
+        self.cands = {pid: list(ALL_NUMBERS) for pid in self.order if pid != self.me}
+        self.say(f"All commits are in. Players: {self.labels(self.order)}")
+        if self.me not in self.order:
+            self.out_of_game = True
+            self.say("We are not in this game (no commit in time).")
+
+    def on_turn(self, msg):
+        turn_id, guesser = msg["turn_id"], msg["guesser"]
+        self.alive = list(msg["alive"])
+        self.withdraw_prompt()
+        self.say(f"\n--- Turn {turn_id}: {self.label(guesser)} guesses. Alive: {self.labels(self.alive)}")
+        if guesser == self.me and not self.out_of_game:
+            self.begin_guess(turn_id)
+
+    def on_guess_made(self, msg):
+        turn_id, guesser, guess = msg["turn_id"], msg["guesser"], msg["guess"]
+        responders = msg["responders"]
+        self.say(f"{self.label(guesser)} guessed {printable(guess, 8)}.")
+        if self.me in responders and not self.out_of_game and self.secret is not None:
+            self.begin_feedback(turn_id, guesser, guess)
+
+    def on_turn_result(self, msg):
+        turn_id, guesser, guess = msg["turn_id"], msg["guesser"], msg.get("guess")
+        self.withdraw_prompt(f"turn {turn_id} is over")
+        if msg.get("skipped") or guess is None:
+            self.say(f"Turn {turn_id}: {self.label(guesser)} did not guess in time - skipped.")
+        else:
+            parts = []
+            for r in msg["results"]:
+                pid, a, b = r["player"], r["a"], r["b"]
+                if not is_valid_feedback(a, b):
+                    continue
+                self.history.setdefault(pid, []).append((turn_id, guess, a, b))
+                if pid in self.cands:
+                    self.cands[pid] = filter_candidates(self.cands[pid], guess, a, b)
+                parts.append(f"{self.label(pid)} {a}A{b}B")
+            self.say(f"Turn {turn_id}: {self.label(guesser)} guessed {printable(guess, 8)} -> "
+                     + ("; ".join(parts) or "no answers"))
+        for key, text in (("eliminated", "was guessed (4A0B) and is out"),
+                          ("forfeited", "forfeited"), ("disqualified", "was disqualified")):
+            for pid in msg.get(key, []):
+                self.say(f"  x {self.label(pid)} {text}")
+                if pid in self.alive:
+                    self.alive.remove(pid)
+                self.cands.pop(pid, None)
+                if pid == self.me:
+                    self.out_of_game = True
+                    self.say("  You are out of the game - now watching as a spectator.")
+        if self.cands:
+            self.say("  candidates left: " + ", ".join(
+                f"{self.label(p)} {len(c)}" for p, c in self.cands.items()))
+
+    def on_reveal_request(self, msg):
+        if self.secret is None:
+            self.say("[warning] REVEAL_REQUEST, but we never committed a secret.")
+            return
+        self.send({"type": "REVEAL", "secret": self.secret, "salt": self.salt})  # at once (§12.5)
+        self.say(f"Reveal requested ({printable(msg.get('reason'), 20)}): "
+                 f"sent our secret {self.secret} and salt automatically.")
+
+    def on_revealed(self, msg):
+        pid, verdict = msg["player"], msg.get("verdict")
+        secret, salt = msg.get("secret"), msg.get("salt")
+        ours, bad = verify_reveal(self.commits.get(pid), secret, salt, self.history.get(pid, []))
+        line = f"  reveal {self.label(pid)}: secret {printable(secret, 8)}, verdict {printable(verdict, 20)}"
+        if msg.get("bad_turns"):
+            line += f", bad turns {printable(msg.get('bad_turns'), 60)}"
+        if ours != verdict:
+            line += f"   [!] our own check says {ours}" + (f" {bad}" if bad else "")
+        self.say(line)
+
+    def on_game_over(self, msg):
+        self.withdraw_prompt()
+        self.say(f"\n===== GAME OVER ({printable(msg.get('reason'), 20)}, "
+                 f"{printable(msg.get('turns'), 6)} turns) =====")
+        for row in msg["ranking"]:
+            rank = row.get("rank")
+            rank = "-" if rank is None else rank
+            out = row.get("out_turn")
+            when = "" if out is None else f" (out in turn {out})"
+            mark = "   <- you" if row.get("player") == self.me else ""
+            self.say(f"  {rank:>2}  {self.label(row.get('player'))}  "
+                     f"{printable(row.get('status'), 10)}{when}{mark}")
+        self.game_over = True
+        self.done = True
+
+    def on_error(self, msg):
+        # Never answer an ERROR (§13); just show it.
+        fatal = msg.get("fatal") is True
+        self.say(f"[server error] {printable(msg.get('code'), 30)}: {printable(msg.get('message'))}"
+                 + (" (fatal)" if fatal else ""))
+        if fatal:
+            self.say("The server ends our connection after a fatal error. Exiting.")
+            self.done = True
+
+    def on_ping(self, msg):
+        self.send(make_pong(msg))
+
+    def on_chat(self, msg):
+        self.say(f"[chat] {self.label(msg.get('from'))}: {printable(msg.get('text'))}")
+
+
+# =====================================================================
+# 8. Human client (console)                                      §5.4
+# =====================================================================
+
+
+@dataclass
+class Prompt:
+    """A question we are waiting for the user to answer."""
+
+    kind: str  # "secret", "guess", "feedback" or "confirm"
+    question: str
+    deadline: float  # time.monotonic() value; after it the prompt is withdrawn
+    turn_id: int | None = None
+    data: dict = field(default_factory=dict)
+    warned: bool = False  # the "10 seconds left" reminder was printed (or not needed)
+
+
+_FEEDBACK_RE = re.compile(r"([0-4])\s*[aA]\s*([0-4])\s*[bB]|([0-4])\s*[\s,]\s*([0-4])")
+
+
+def parse_feedback(text):
+    """'1A2B', '1a2b', '1 2' or '1,2' -> (1, 2); None if not a legal answer."""
+    m = _FEEDBACK_RE.fullmatch(text.strip())
+    if not m:
+        return None
+    a, b = (m.group(1), m.group(2)) if m.group(1) is not None else (m.group(3), m.group(4))
+    pair = (int(a), int(b))
+    return pair if pair in LEGAL_FEEDBACK else None
+
+
+HELP_TEXT = """Commands (any time):
+  /chat TEXT   send a chat message to everyone
+  /cands       show how many secrets are still possible for each opponent
+  /quit        leave the game (counts as a disconnect / forfeit)
+  /help        show this help"""
+
+
+class HumanClient(PlayerSession):
+    """Console player.  COMMIT and REVEAL are automatic; guesses and feedback
+    are typed by the user, who is asked only when it is their turn (§5.4)."""
+
+    kind = "human"
+
+    def __init__(self, *args, use_stdin=True, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.use_stdin = use_stdin
+        self.prompt = None  # the Prompt we are waiting on, or None
+
+    # ----- keyboard -----------------------------------------------------
+
+    def start_input(self):
+        self.say("Type /help for commands.")
+        if self.use_stdin:
+            threading.Thread(target=self._input_reader, name="stdin-reader", daemon=True).start()
+
+    def _input_reader(self):
+        """Input thread: blocking readline() here, never in the main thread (§16.3.2)."""
+        while True:
+            try:
+                line = sys.stdin.readline()
+            except (OSError, ValueError):
+                return
+            if not line:  # stdin closed
+                return
+            self.events.put(("input", line))
+
+    def ask(self, kind, question, deadline, turn_id=None, **data):
+        self.prompt = Prompt(kind, question, deadline, turn_id, data)
+        # A "10 seconds left" reminder only makes sense for longer time limits.
+        self.prompt.warned = deadline - time.monotonic() < 20
+        self.show_prompt()
+
+    def show_prompt(self):
+        p = self.prompt
+        left = max(0, p.deadline - time.monotonic())
+        self.say(f"? {p.question}  [{left:.0f}s left]")
+
+    def withdraw_prompt(self, reason=None):
+        if self.prompt is not None:
+            if reason:
+                self.say(f"(prompt withdrawn: {reason})")
+            self.prompt = None
+
+    def check_deadlines(self):
+        p = self.prompt
+        if p is None:
+            return
+        left = p.deadline - time.monotonic()
+        if left <= 0:
+            self.prompt = None
+            self.on_prompt_expired(p)
+        elif left <= 10 and not p.warned:
+            p.warned = True
+            self.say(f"(!) {left:.0f} seconds left to answer: {p.question}")
+
+    def on_prompt_expired(self, p):
+        if p.kind == "secret":
+            secret = secrets.choice(ALL_NUMBERS)
+            self.say(f"(time is almost up - using the random secret {secret})")
+            self.send_commit(secret)
+        elif p.kind == "guess":
+            self.say("(time is up - prompt withdrawn; the server will skip your turn)")
+        else:
+            self.say("(time is up - prompt withdrawn; a missing feedback means FORFEIT)")
+
+    def handle_input(self, text):
+        text = text.strip()
+        if text.startswith("/"):
+            self.command(text)
+            return
+        p = self.prompt
+        if p is None:
+            if text:
+                self.say("(nothing to answer right now - type /help for commands)")
+            return
+        if p.kind == "secret":
+            self.answer_secret(text)
+        elif p.kind == "guess":
+            self.answer_guess(p, text)
+        elif p.kind == "feedback":
+            self.answer_feedback(p, text)
+        elif p.kind == "confirm":
+            self.answer_confirm(p, text)
+
+    def command(self, text):
+        cmd, _, rest = text.partition(" ")
+        rest = rest.strip()
+        if cmd in ("/chat", "/say"):
+            if is_valid_text(rest, 1, 200):
+                self.send({"type": "CHAT", "text": rest})
+            else:
+                self.say("(chat text must be 1-200 characters without control characters)")
+        elif cmd == "/cands":
+            if self.cands:
+                self.say("candidates left: " + ", ".join(
+                    f"{self.label(p)} {len(c)}" for p, c in self.cands.items()))
+            else:
+                self.say("(no candidate information yet)")
+        elif cmd == "/quit":
+            self.say("Leaving the game.")
+            self.send({"type": "BYE"})
+            self.done = True
+        else:
+            self.say(HELP_TEXT)
+
+    # ----- COMMIT: automatic, the user only picks the number (§5.4.2) -----
+
+    def begin_commit(self):
+        deadline = answer_deadline(self.rules["commit_timeout"], margin=2.0)
+        self.ask("secret", "Choose your secret: 4 different digits (e.g. 0275), "
+                           "or just press Enter for a random one", deadline)
+
+    def answer_secret(self, text):
+        if text == "":
+            text = secrets.choice(ALL_NUMBERS)
+        elif not is_valid_number(text):
+            self.say("(need exactly 4 different digits 0-9, e.g. 0275)")
+            self.show_prompt()
+            return
+        self.prompt = None
+        self.send_commit(text)
+        self.say(f"Your secret is {text}. Only its hash (commit) was sent; "
+                 f"the salt stays in memory until a reveal.")
+
+    # ----- GUESS: only when TURN.guesser is us (§5.4.3) ---------------------
+
+    def begin_guess(self, turn_id):
+        if self.cands:
+            self.say("  candidates left: " + ", ".join(
+                f"{self.label(p)} {len(c)}" for p, c in self.cands.items()))
+        deadline = answer_deadline(self.rules["guess_timeout"])
+        self.ask("guess", f"Turn {turn_id} - YOUR TURN. Type your guess (4 different digits)",
+                 deadline, turn_id)
+
+    def answer_guess(self, p, text):
+        if not is_valid_number(text):
+            self.say("(need exactly 4 different digits 0-9, e.g. 0275)")
+            self.show_prompt()
+            return
+        self.prompt = None
+        self.send_guess(p.turn_id, text)
+
+    # ----- FEEDBACK: prefilled, a changed value needs confirmation (§5.4.4) ---
+
+    def begin_feedback(self, turn_id, guesser, guess, deadline=None):
+        a, b = score(guess, self.secret)
+        if deadline is None:
+            deadline = answer_deadline(self.rules["feedback_timeout"])
+        self.ask("feedback",
+                 f"{self.label(guesser)} guessed {guess}; your secret is {self.secret} -> {a}A{b}B. "
+                 f"Press Enter to send {a}A{b}B (or type another answer like 1A2B). "
+                 f"No answer in time = FORFEIT!",
+                 deadline, turn_id, guesser=guesser, guess=guess, a=a, b=b)
+
+    def answer_feedback(self, p, text):
+        if text == "":
+            pair = (p.data["a"], p.data["b"])
+        else:
+            pair = parse_feedback(text)
+            if pair is None:
+                self.say("(type an answer like 1A2B or '1 2'; a+b <= 4 and 3A1B is impossible)")
+                self.show_prompt()
+                return
+        if pair == (p.data["a"], p.data["b"]):
+            self.prompt = None
+            self.send_feedback(p.turn_id, *pair)
+            self.say(f"Sent {pair[0]}A{pair[1]}B.")
+            return
+        # The user changed the computed answer: ask once more (§5.4.4).
+        data = dict(p.data, chosen=pair)
+        self.ask("confirm",
+                 f"Your secret {self.secret} gives {p.data['a']}A{p.data['b']}B, but you typed "
+                 f"{pair[0]}A{pair[1]}B. A wrong answer gets you DISQUALIFIED at the reveal. "
+                 f"Type yes to send {pair[0]}A{pair[1]}B anyway, anything else to go back",
+                 p.deadline, p.turn_id, **data)
+
+    def answer_confirm(self, p, text):
+        if text.lower() in ("y", "yes"):
+            a, b = p.data["chosen"]
+            self.prompt = None
+            self.send_feedback(p.turn_id, a, b)
+            self.say(f"Sent {a}A{b}B.")
+        else:
+            self.begin_feedback(p.turn_id, p.data["guesser"], p.data["guess"], deadline=p.deadline)
+
+
+# =====================================================================
+# 9. Command line interface                                      §5.2
 # =====================================================================
 
 
@@ -378,9 +1064,19 @@ def run_server(args):
     return 1
 
 
+def check_identity(args):
+    """name and team must be 1-20 characters without control characters (§9)."""
+    for option, value in (("--name", args.name), ("--team", args.team)):
+        if not is_valid_text(value, 1, 20):
+            print(f"error: {option} must be 1-20 characters without control characters")
+            return False
+    return True
+
+
 def run_client(args):
-    print("client: not implemented yet (issue #2)")
-    return 1
+    if not check_identity(args):
+        return 2
+    return HumanClient(args.host, args.port, args.name, args.team).run()
 
 
 def run_ai(args):
