@@ -12,14 +12,14 @@ python bc.py server [--host 0.0.0.0] [--port 5040] [--players 2] [--bots 0]
                     [--reveal-timeout 15] [--max-turns 120] [--max-skips 3]
                     [--games 1] [--log-dir logs]
 python bc.py client --host HOST [--port 5040] --name NAME [--team G00]
-python bc.py ai     --host HOST [--port 5040] --name NAME [--team G00] [--quiet]
+python bc.py ai     --host HOST [--port 5040] --name NAME [--team G00] [--quiet] [--strategy v2]
 ```
 
 `python bc.py <subcommand> --help` lists every option with its default. Timeouts are in seconds and may be
 fractional (for example `--guess-timeout 1.5`).
 
 Status: all three modes work. That covers the shared protocol layer and CLI (#1), the human `client` (#2), the
-`ai` with the v1 strategy (#3) and the `server` (#4).
+`ai` (#3; strategies v1 and v2, #11) and the `server` (#4).
 
 ## How to play (client)
 
