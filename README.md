@@ -18,8 +18,8 @@ python bc.py ai     --host HOST [--port 5040] --name NAME [--team G00] [--quiet]
 `python bc.py <subcommand> --help` lists every option with its default. Timeouts are in seconds and may be
 fractional (for example `--guess-timeout 1.5`).
 
-Status: the shared protocol layer and CLI (#1) and the human `client` (#2) are done. The `ai` (#3) and
-`server` (#4) modes are still to come.
+Status: the shared protocol layer and CLI (#1), the human `client` (#2) and the `ai` with the v1 strategy
+(#3) are done. The `server` (#4) is still to come.
 
 ## How to play (client)
 
@@ -55,6 +55,28 @@ folder. That folder is separate from the server's `--log-dir` and ignored by git
 Exit code: 0 after a normal `GAME_OVER`, 1 after a fatal `ERROR` or a lost connection, 2 for a bad
 `--name`/`--team`.
 
+## AI player
+
+```
+python bc.py ai --host 127.0.0.1 --port 5040 --name G00-AI --team G00 [--quiet]
+```
+
+The AI plays without any input. It picks a random secret with `secrets` and sends the commit. Feedback is
+always the honest answer, sent at once, and reveals are immediate. It answers `PING` and ignores unknown
+messages. `--quiet` prints only errors and the final result. Like the client, it logs to `client_logs/`.
+
+**How it thinks (v1, the spec's baseline, §5.5).** For every opponent still in the game the AI keeps the list
+of secrets that are still possible. It starts with all 5040. Every `TURN_RESULT` shrinks these lists, not only
+the results of our own guesses. On our turn:
+
+1. **Target:** the opponent with the fewest possible secrets left.
+2. **Guess:** the target's possible secret that splits its list into the most different answers (`aAbB`).
+   This is Kooi's "most parts" rule. Big lists are estimated on a random sample of 500. The search stops after
+   1 s (or a quarter of the guess timeout), and it stops at once if a guess reaches the maximum of 14 parts.
+
+Offline, against one opponent, v1 needed 5.26 guesses on average and at most 7 (300 random secrets). The
+slowest decision took 0.17 s.
+
 ## Tests
 
 ```
@@ -74,7 +96,8 @@ python -m unittest discover -s tests -v  # standard library only
 | 6. Client log | `JsonlLog`: own log in the server's record format, written to `client_logs/` | §5.6 |
 | 7. Player session | `PlayerSession`: connection, reader thread, main event loop, public game state (history, candidates per opponent), automatic COMMIT/REVEAL/PONG, local reveal check. Shared by client and AI | §11–12, §16.3 |
 | 8. Human client | `HumanClient`: input thread, prompts with deadlines, prefilled feedback plus confirmation | §5.4 |
-| 9. CLI | `build_parser` with the exact §5.2 options | §5.2 |
+| 9. AI | `pick_target`, `most_parts_guess`, `choose_guess_v1`, `AIPlayer` | §5.5 |
+| 10. CLI | `build_parser` with the exact §5.2 options | §5.2 |
 
 ## Course materials
 
