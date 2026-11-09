@@ -1,0 +1,4 @@
+# One-click launchers: keep the line endings each system needs, whatever git's autocrlf setting is.
+# cmd.exe can misread batch files with LF-only lines; bash fails on CRLF ("$'\r': command not found").
+*.bat     text eol=crlf
+*.command text eol=lf
