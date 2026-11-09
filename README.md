@@ -109,6 +109,46 @@ Check a server with the teacher's self-test tool (keep it in the untracked `cour
 python course/bc_selftest.py --server "python bc.py server" --json selftest.json
 ```
 
+## Checkpoint 1: our client and AI against the reference server
+
+`tools/checkpoint1.py` (standard library only) plays N games (default 3) with our `bc.py client` and our
+`bc.py ai` against a BC/1.0 server, collects all logs into one dated folder and prints a summary. The server
+is the teacher's reference `bc.py`, kept in the untracked `course/` folder. The tool never contains or
+imports it; you either start it yourself or give its command.
+
+```
+# Mode 1: the server already runs. It needs --players 2, and --games 0 (or at least as many games).
+python3 course/bc.py server --port 5040 --players 2 --games 0 --log-dir logs/reference
+python3 tools/checkpoint1.py --host 127.0.0.1 --port 5040 --team GXX --server-log-dir logs/reference
+
+# Mode 2: the tool starts the server and adds --host --port --players 2 --games N --log-dir itself.
+python3 tools/checkpoint1.py --team GXX --games 3 --server-cmd "python3 course/bc.py server"
+```
+
+| Option | Meaning |
+|---|---|
+| `--host`, `--port` | the server (default `127.0.0.1:5040`) |
+| `--team` | **required**: our group code (`GXX` above is a placeholder). Nothing in the repository hardcodes it |
+| `--games` | number of games (default 3) |
+| `--name-prefix` | names are `PREFIX` + `human` / `ai` (default `TEAM-`, e.g. `GXX-human`, `GXX-ai`) |
+| `--out` | output folder (default `checkpoint1_out/`); every run gets a `<date>-<time>/` subfolder |
+| `--server-cmd` | mode 2: the command that starts the server |
+| `--server-log-dir` | mode 1: the running server's `--log-dir`; the logs of our games are copied |
+| `--game-timeout`, `--python`, `--seed` | give up a game after N seconds (300); Python for `bc.py`; seed for the guesses |
+
+The client is the real console client, driven through its stdin and stdout like a quick player: Enter for a
+random secret (the commit is automatic), a random legal guess on our turn, Enter to accept the prefilled
+feedback. The reveal is automatic in the client. Between games the tool waits 1 s and retries a refused
+join, because a server that just ended a game refuses `HELLO` with `GAME_IN_PROGRESS` for a moment.
+
+Each run folder holds `client_logs/` (our client and AI logs), `server_logs/`, `console/` (what every
+process printed), `summary.txt` and `summary.json`. The summary lists every game with its `game_id`, end
+reason, turns, our two players' ranks, and any `ERROR`, `TIMEOUT`, `FORFEIT`, `DQ`, failed reveal or skipped
+turn. The exit code is 0 only if all games finished without such problems.
+
+**Never commit** `checkpoint1_out/`, `logs/`, `client_logs/` (real game logs, all in `.gitignore`) or any
+teacher file from `course/`. Submit the logs the way the course asks, not through git.
+
 ## Tests
 
 ```
