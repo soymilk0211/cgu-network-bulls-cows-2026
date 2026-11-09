@@ -18,8 +18,8 @@ python bc.py ai     --host HOST [--port 5040] --name NAME [--team G00] [--quiet]
 `python bc.py <subcommand> --help` lists every option with its default. Timeouts are in seconds and may be
 fractional (for example `--guess-timeout 1.5`).
 
-Status: the shared protocol layer and CLI (#1), the human `client` (#2) and the `ai` with the v1 strategy
-(#3) are done. The `server` (#4) is still to come.
+Status: all three modes work. That covers the shared protocol layer and CLI (#1), the human `client` (#2), the
+`ai` with the v1 strategy (#3) and the `server` (#4).
 
 ## How to play (client)
 
@@ -77,6 +77,38 @@ the results of our own guesses. On our turn:
 Offline, against one opponent, v1 needed 5.26 guesses on average and at most 7 (300 random secrets). The
 slowest decision took 0.17 s.
 
+## Hosting (server)
+
+```
+python bc.py server --port 5040 --players 4 --bots 1          # 4 players, 1 of them our AI
+python bc.py server --players 2 --bots 2 --log-dir logs       # hosts one AI-only game and exits
+```
+
+- **Lobby:** the server listens on `--host` (default `0.0.0.0`, all IPv4 addresses) and waits for `--players`
+  players (2–6). If the server's console is a terminal, typing `start` begins the game early once at least 2
+  players are in. `--bots K` starts K of our own `ai` players (`BOT-1` … `BOT-K`) as subprocesses. They
+  connect to `127.0.0.1` when `--host` is `0.0.0.0`, and the server collects them after every game.
+- **Game:** the server runs the whole BC/1.0 state machine LOBBY → COMMIT → PLAY → END → OVER (§10–§14). That
+  covers every time limit, the public consistency check after every feedback, reveals and verdicts, and the
+  ranking. All error codes are sent in the spec's check order. Feedback is never shown before every answer
+  of the turn is in.
+- **After a game:** the server closes all connections of that game. `--games N` hosts N games one after the
+  other (`0` = until stopped), then the process exits by itself.
+- **Logs:** one JSON Lines file per game in `--log-dir`, named `<date>-<time>-<game_id>.jsonl`. Every record
+  is `{"ts", "dir", "peer", "msg"}`, and `peer` is the `player_id`, or `IP:port` before `HELLO`. Unparsable
+  input is logged as `{"raw": …}`. Only server logs go into this folder; the bots log to `client_logs/`.
+- **Robustness:** asyncio runs everything in one thread, with one reading task and one writing task per
+  connection. Each connection has a bounded send queue, so a client that stops reading is dropped instead of
+  slowing everyone down. An error in one connection only closes that connection.
+- **Bad options:** a bad `--players`, `--bots`, timeout, `--max-turns`, `--max-skips` or `--games` value
+  makes the server exit with code 2.
+
+Check a server with the teacher's self-test tool (keep it in the untracked `course/` folder):
+
+```
+python course/bc_selftest.py --server "python bc.py server" --json selftest.json
+```
+
 ## Tests
 
 ```
@@ -97,7 +129,8 @@ python -m unittest discover -s tests -v  # standard library only
 | 7. Player session | `PlayerSession`: connection, reader thread, main event loop, public game state (history, candidates per opponent), automatic COMMIT/REVEAL/PONG, local reveal check. Shared by client and AI | §11–12, §16.3 |
 | 8. Human client | `HumanClient`: input thread, prompts with deadlines, prefilled feedback plus confirmation | §5.4 |
 | 9. AI | `pick_target`, `most_parts_guess`, `choose_guess_v1`, `AIPlayer` | §5.5 |
-| 10. CLI | `build_parser` with the exact §5.2 options | §5.2 |
+| 10. Server | `GameServer` (lobby, state machine, timeouts, reveals, ranking, bots, logs), `Connection` (bounded send queue), `ServerPlayer`, `hello_error`, `compute_ranking` | §5.3, §10–§14, §16.1 |
+| 11. CLI | `build_parser` with the exact §5.2 options; `server_arg_problems` | §5.2 |
 
 ## Course materials
 
