@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
 """bc.py - multiplayer Bulls & Cows (幾A幾B) over TCP, protocol BC/1.0.
 
-One file, three subcommands (spec §5.1-5.2):
+One file, three subcommands (spec §5.1-5.2), plus an optional window:
 
     python bc.py server [...]   game server / referee     (issue #4)
     python bc.py client [...]   human player, console     (issue #2)
     python bc.py ai     [...]   automatic AI player       (issue #3)
+    python bc.py gui    [...]   human player, window (tkinter); an extra, the console client is graded
 
 Only the Python standard library is used (Python 3.10+).
 
@@ -20,7 +21,8 @@ Layout of this file (search for the "=====" banners):
     8. HumanClient: console player          (§5.4)
     9. AIPlayer: automatic player, v1 most-parts / v2 entropy (§5.5)
    10. GameServer: the referee, asyncio     (§5.3, §10-§14)
-   11. Command line interface               (§5.2)
+   11. GUI client: optional tkinter window  (extra; reuses HumanClient)
+   12. Command line interface               (§5.2)
 """
 
 import argparse
@@ -1910,7 +1912,563 @@ class GameServer:
 
 
 # =====================================================================
-# 11. Command line interface                                     §5.2
+# 11. GUI client (optional window, tkinter)
+# =====================================================================
+#
+# `python bc.py gui ...` opens a window for the same human player as
+# `python bc.py client`.  The console client stays the graded interface
+# (§5.4); the window is an extra.  It is NOT a second network stack:
+# GuiSession is a HumanClient, so HELLO, COMMIT, REVEAL, PONG, the
+# prefilled feedback with its confirmation and every deadline work exactly
+# as in the console.  Only the output and the answers travel differently:
+#
+#   network thread  GuiSession.run(): the PlayerSession main loop (with its
+#                   reader thread).  It does ALL the sending.
+#   Tk main thread  GuiApp: widgets only.  It never touches the socket.
+#
+#   GuiSession --ui_events queue--> GuiApp.poll() (every 100 ms, Tk after())
+#   GuiApp --session.events queue--> GuiSession: ("answer", (seq, text)) for a
+#          question, ("input", "/chat ...") and ("input", "/quit")
+#
+# Both directions are queues, so the window never waits for the network.
+# tkinter is imported only in run_gui(), so bc.py also runs where tkinter is
+# missing.  The helpers below do not need tkinter and are unit-tested.
+
+GUI_POLL_MS = 100  # how often the window reads the session's events
+GUI_MAX_LINES = 2000  # lines kept in the message box
+GUI_STATUS = {"SURVIVOR": "存活", "GUESSED": "被猜中", "FORFEIT": "棄權", "DQ": "取消資格"}
+GUI_OUT_LISTS = (("eliminated", "GUESSED"), ("forfeited", "FORFEIT"), ("disqualified", "DQ"))
+GUI_REASON = {"LAST_PLAYER": "只剩一位玩家", "MAX_TURNS": "達到回合上限", "ABORTED": "對局中止"}
+GUI_VERDICT = {"OK": "通過", "BAD_COMMIT": "承諾不符", "INCONSISTENT": "回報不一致", "NO_REVEAL": "未揭示"}
+
+
+def feedback_text(a, b):
+    """(1, 2) -> '1A2B'."""
+    return f"{a}A{b}B"
+
+
+def gui_name(snapshot, pid):
+    """'p2 阿明' for the window; our own id gets '（你）'."""
+    info = snapshot["players"].get(pid)
+    name = printable(info.get("name"), 20) if isinstance(info, dict) else "?"
+    you = "（你）" if pid == snapshot["me"] else ""
+    return f"{printable(pid, 20)} {name}{you}"
+
+
+def gui_word(table, value):
+    """Chinese word for a status / reason / verdict code, with the code itself."""
+    code = printable(value, 20)
+    return f"{table[value]}（{code}）" if value in table else code
+
+
+def check_answer_text(kind, text):
+    """Check what the user typed for a question.  Returns '' if OK, else a message."""
+    text = text.strip()
+    if kind == "secret" and (text == "" or is_valid_number(text)):
+        return ""
+    if kind == "guess" and is_valid_number(text):
+        return ""
+    if kind == "feedback" and (text == "" or parse_feedback(text) is not None):
+        return ""
+    if kind == "feedback":
+        return "請輸入像 1A2B 或「1 2」的答案：A+B 不超過 4，而且沒有 3A1B"
+    if kind in ("secret", "guess"):
+        return "請輸入 4 個不同的數字（0–9），例如 0275"
+    return ""
+
+
+def prompt_view(prompt, snapshot):
+    """What the action panel shows for a Prompt (None = nothing to do).
+
+    Returns {"title", "hint", "entry", "buttons"}.  entry is the prefilled text
+    of the input field, or None for no field.  buttons is a list of
+    (label, text to send); None as the text means "what is in the field".
+    """
+    if prompt is None:
+        return None
+    d = prompt.data
+    if prompt.kind == "secret":
+        return {"title": "選擇你的秘密數字",
+                "hint": "輸入 4 個不同的數字，或按「隨機」。送出時只傳出雜湊值（承諾），鹽值留在本機，"
+                        "需要揭示時會自動送出。時間到會自動使用隨機數字。",
+                "entry": "", "buttons": [("送出秘密", None), ("隨機", "")]}
+    if prompt.kind == "guess":
+        return {"title": f"第 {prompt.turn_id} 回合：輪到你喊數",
+                "hint": "輸入 4 個不同的數字。時間到只會跳過這一回合（連續跳過太多次視同棄權）。",
+                "entry": "", "buttons": [("送出猜測", None)]}
+    if prompt.kind == "feedback":
+        answer = feedback_text(d["a"], d["b"])
+        return {"title": f"第 {prompt.turn_id} 回合：回報 {gui_name(snapshot, d['guesser'])} 的猜測",
+                "hint": f"對方猜 {d['guess']}，你的秘密是 {snapshot['secret']}，正確答案 {answer} 已預填。"
+                        f"直接按「送出回報」即可；改成別的答案還要再確認一次。時間到沒回報 = 棄權！",
+                "entry": answer, "buttons": [("送出回報", None)]}
+    if prompt.kind == "confirm":
+        right, chosen = feedback_text(d["a"], d["b"]), feedback_text(*d["chosen"])
+        return {"title": f"確定要送出 {chosen} 嗎？",
+                "hint": f"你的秘密 {snapshot['secret']} 對 {d['guess']} 的正確答案是 {right}，你輸入的卻是 "
+                        f"{chosen}。錯誤的回報會在揭示時被取消資格（DQ）！",
+                "entry": None, "buttons": [(f"確定送出 {chosen}", "yes"), ("返回修改", "no")]}
+    return None
+
+
+def turn_result_row(msg, snapshot):
+    """One history row (turn, guesser, guess, answers, who is out) for a TURN_RESULT."""
+    guess = msg.get("guess")
+    if msg.get("skipped") or guess is None:
+        answers = "（時間到沒有喊數，跳過）"
+    else:
+        answers = "；".join(f"{gui_name(snapshot, r['player'])} {feedback_text(r['a'], r['b'])}"
+                           for r in msg["results"] if is_valid_feedback(r.get("a"), r.get("b"))) or "-"
+    out = [f"{gui_name(snapshot, pid)} {GUI_STATUS[status]}"
+           for key, status in GUI_OUT_LISTS for pid in msg.get(key, [])]
+    return (printable(msg["turn_id"], 6), gui_name(snapshot, msg["guesser"]), printable(guess or "-", 8),
+            answers, "、".join(out))
+
+
+def reveal_row(msg, snapshot):
+    """History row for a REVEALED message."""
+    verdict = "判定 " + gui_word(GUI_VERDICT, msg.get("verdict"))
+    if msg.get("bad_turns"):
+        verdict += f"，錯誤回合 {printable(msg.get('bad_turns'), 60)}"
+    return ("揭示", gui_name(snapshot, msg["player"]), printable(msg.get("secret") or "-", 8), verdict, "")
+
+
+def ranking_rows(msg, snapshot):
+    """History rows for the final ranking in GAME_OVER."""
+    rows = []
+    for r in msg["ranking"]:
+        rank = "-" if r.get("rank") is None else printable(r.get("rank"), 4)
+        out = "" if r.get("out_turn") is None else f"第 {printable(r.get('out_turn'), 6)} 回合出局"
+        status = gui_word(GUI_STATUS, r.get("status"))
+        rows.append((f"第 {rank} 名", gui_name(snapshot, r.get("player")), "", status, out))
+    return rows
+
+
+class GuiSession(HumanClient):
+    """A HumanClient for the window: text and questions go to `ui_events`.
+
+    The window reads these events (oldest first):
+      ("text", line)                      a line the console client would print
+      ("msg", msg, snapshot)              a server message, after it was handled
+      ("prompt", (seq, prompt, snapshot)) a question to show; ("prompt", None) = none
+      ("done", exit_code)                 run() has ended
+    """
+
+    def __init__(self, host, port, name, team, log_dir=CLIENT_LOG_DIR):
+        self.ui_events = queue.Queue()
+        self.prompt_seq = 0  # number of the last question sent to the window
+        self.shown = False  # the window shows a question
+        super().__init__(host, port, name, team, out=lambda text: self.ui_events.put(("text", text)),
+                         log_dir=log_dir, use_stdin=False)
+
+    def start(self):
+        """Run the session on a background thread, the 'network thread'."""
+        def network():
+            code = 1
+            try:
+                code = self.run()
+            finally:
+                self.ui_events.put(("done", code))
+        threading.Thread(target=network, name="network", daemon=True).start()
+
+    def start_input(self):
+        """No keyboard thread: the answers come from the window."""
+
+    def snapshot(self):
+        """A copy of the public state for the window, which never reads ours directly."""
+        players = {pid: dict(p) for pid, p in self.players.items() if isinstance(p, dict)}
+        return {"me": self.me, "players": players, "order": list(self.order), "alive": list(self.alive),
+                "secret": self.secret, "cands": {pid: len(c) for pid, c in self.cands.items()},
+                "out_of_game": self.out_of_game, "game_id": self.game_id, "game_over": self.game_over}
+
+    def handle_message(self, msg):
+        super().handle_message(msg)
+        self.ui_events.put(("msg", msg, self.snapshot()))
+
+    def show_prompt(self):
+        """Instead of printing the question, give the window a copy of it."""
+        p = self.prompt
+        self.prompt_seq += 1
+        self.shown = True
+        copy = Prompt(p.kind, p.question, p.deadline, p.turn_id, dict(p.data))
+        self.ui_events.put(("prompt", (self.prompt_seq, copy, self.snapshot())))
+
+    def check_deadlines(self):
+        super().check_deadlines()
+        if self.prompt is None and self.shown:  # answered, timed out or withdrawn
+            self.shown = False
+            self.ui_events.put(("prompt", None))
+
+    def handle_event(self, kind, data):
+        if kind == "answer":  # (seq, text): an answer to question number seq
+            seq, text = data
+            if self.prompt is not None and seq == self.prompt_seq:
+                self.handle_input(text)
+            else:  # the question changed or closed meanwhile: never send a late answer
+                self.say("(that answer came too late; nothing was sent)")
+            return
+        super().handle_event(kind, data)
+
+
+class GuiApp:
+    """The window.  Runs only in the Tk main thread; see the section comment."""
+
+    def __init__(self, root, session, tk, ttk, tkfont, messagebox):
+        self.root, self.session = root, session
+        self.tk, self.ttk, self.messagebox = tk, ttk, messagebox
+        self.snapshot = session.snapshot()
+        self.prompt = None  # (seq, Prompt) shown in the action panel
+        self.buttons = []
+        self.out_status = {}  # player_id -> GUI_STATUS key, once that player is out
+        self.result = None  # the session's exit code once it ended
+        self.closing = None  # time.monotonic() when the user asked to quit
+        self.last_problem = None  # last server error / network message, for the final dialog
+        root.title(f"幾A幾B 連線對戰（BC/1.0）－ {session.name}")
+        root.geometry("1040x760")
+        root.minsize(760, 560)
+        root.protocol("WM_DELETE_WINDOW", self.on_close)
+        self.build(tkfont)
+        self.show_prompt(None)
+        root.after(GUI_POLL_MS, self.poll)
+
+    # ----- widgets ------------------------------------------------------
+
+    def build(self, tkfont):
+        tk, ttk, root = self.tk, self.ttk, self.root
+        base = tkfont.nametofont("TkDefaultFont")
+        bold = base.copy()
+        bold.configure(weight="bold")
+        big = base.copy()
+        big.configure(size=max(abs(base.cget("size")), 9) + 6, weight="bold")  # size < 0 means pixels
+        style = ttk.Style(root)
+        style.configure("Title.TLabel", font=bold)
+        style.configure("Treeview", rowheight=base.metrics("linespace") + 6)
+        root.columnconfigure(0, weight=1)
+        root.rowconfigure(1, weight=3)
+        root.rowconfigure(3, weight=2)
+
+        top = ttk.Frame(root, padding=(10, 8, 10, 2))
+        top.grid(row=0, column=0, sticky="ew")
+        self.conn_var = tk.StringVar(value=f"伺服器 {self.session.peer}：連線中…")
+        self.me_var = tk.StringVar(value=f"玩家：{self.session.name}（隊伍 {self.session.team}）")
+        self.secret_var = tk.StringVar(value="你的秘密：尚未選擇")
+        self.status_var = tk.StringVar(value="正在連線…")
+        for col, var in enumerate((self.conn_var, self.me_var, self.secret_var)):
+            ttk.Label(top, textvariable=var).grid(row=0, column=col, sticky="w", padx=(0, 28))
+        ttk.Label(top, textvariable=self.status_var, style="Title.TLabel").grid(
+            row=1, column=0, columnspan=3, sticky="w", pady=(6, 0))
+
+        middle = ttk.Panedwindow(root, orient="horizontal")
+        middle.grid(row=1, column=0, sticky="nsew", padx=10, pady=(6, 0))
+        left = ttk.Labelframe(middle, text="玩家", padding=4)
+        right = ttk.Labelframe(middle, text="對局紀錄：每回合的喊數、回報、揭示與名次", padding=4)
+        middle.add(left, weight=2)
+        middle.add(right, weight=5)
+        self.players_view = self.table(left, (("player", "玩家", 150), ("team", "隊伍", 50),
+                                              ("status", "狀態", 70), ("cands", "候選數", 60)))
+        self.history_view = self.table(right, (("turn", "回合", 60), ("guesser", "喊數者", 120),
+                                               ("guess", "猜測", 50), ("answers", "回報", 280),
+                                               ("out", "出局", 140)))
+        self.history_view.tag_configure("reveal", background="#eef4ff")
+        self.history_view.tag_configure("rank", background="#fff6dd")
+
+        action = ttk.Labelframe(root, text="你的動作", padding=(10, 6))
+        action.grid(row=2, column=0, sticky="ew", padx=10, pady=8)
+        action.columnconfigure(2, weight=1)
+        self.action_title = ttk.Label(action, style="Title.TLabel")
+        self.action_title.grid(row=0, column=0, columnspan=3, sticky="w")
+        self.countdown_var = tk.StringVar()
+        self.countdown = ttk.Label(action, textvariable=self.countdown_var, font=bold)
+        self.countdown.grid(row=0, column=3, sticky="e")
+        self.action_hint = ttk.Label(action, justify="left", wraplength=900)
+        self.action_hint.grid(row=1, column=0, columnspan=4, sticky="w", pady=(2, 6))
+        action.bind("<Configure>", lambda e: self.action_hint.configure(wraplength=max(300, e.width - 40)))
+        self.entry_var = tk.StringVar()
+        self.entry = ttk.Entry(action, textvariable=self.entry_var, width=8, font=big, justify="center")
+        self.entry.grid(row=2, column=0, sticky="w", padx=(0, 10))
+        self.entry.bind("<Return>", lambda e: self.press_first_button())
+        self.buttons_frame = ttk.Frame(action)
+        self.buttons_frame.grid(row=2, column=1, sticky="w")
+        self.error_var = tk.StringVar()
+        ttk.Label(action, textvariable=self.error_var, foreground="#b00020").grid(
+            row=3, column=0, columnspan=4, sticky="w")
+
+        log = ttk.Labelframe(root, text="訊息（與文字版 client 顯示的內容相同）", padding=4)
+        log.grid(row=3, column=0, sticky="nsew", padx=10)
+        log.columnconfigure(0, weight=1)
+        log.rowconfigure(0, weight=1)
+        self.text = tk.Text(log, height=8, wrap="word", state="disabled", relief="flat")
+        bar = ttk.Scrollbar(log, orient="vertical", command=self.text.yview)
+        self.text.configure(yscrollcommand=bar.set)
+        self.text.grid(row=0, column=0, sticky="nsew")
+        bar.grid(row=0, column=1, sticky="ns")
+
+        bottom = ttk.Frame(root, padding=(10, 6, 10, 10))
+        bottom.grid(row=4, column=0, sticky="ew")
+        bottom.columnconfigure(1, weight=1)
+        ttk.Label(bottom, text="聊天：").grid(row=0, column=0)
+        self.chat_var = tk.StringVar()
+        self.chat_entry = ttk.Entry(bottom, textvariable=self.chat_var)
+        self.chat_entry.grid(row=0, column=1, sticky="ew")
+        self.chat_entry.bind("<Return>", lambda e: self.send_chat())
+        self.chat_button = ttk.Button(bottom, text="送出聊天", command=self.send_chat)
+        self.chat_button.grid(row=0, column=2, padx=6)
+        self.quit_button = ttk.Button(bottom, text="離開遊戲", command=self.on_close)
+        self.quit_button.grid(row=0, column=3)
+
+    def table(self, parent, columns):
+        parent.columnconfigure(0, weight=1)
+        parent.rowconfigure(0, weight=1)
+        view = self.ttk.Treeview(parent, columns=[c[0] for c in columns], show="headings", height=8)
+        for key, title, width in columns:
+            view.heading(key, text=title, anchor="w")
+            view.column(key, width=width, minwidth=40, anchor="w", stretch=True)
+        bar = self.ttk.Scrollbar(parent, orient="vertical", command=view.yview)
+        view.configure(yscrollcommand=bar.set)
+        view.grid(row=0, column=0, sticky="nsew")
+        bar.grid(row=0, column=1, sticky="ns")
+        return view
+
+    # ----- events from the network thread ------------------------------
+
+    def poll(self):
+        """Tk timer: handle what the network thread sent, then update the countdown."""
+        for _ in range(200):  # at most 200 per tick, so the window stays responsive
+            try:
+                event = self.session.ui_events.get_nowait()
+            except queue.Empty:
+                break
+            if event[0] == "text":
+                self.add_text(event[1])
+            elif event[0] == "msg":
+                self.snapshot = event[2]
+                self.on_message(event[1])
+            elif event[0] == "prompt":
+                self.show_prompt(event[1])
+            elif event[0] == "done":
+                self.on_done(event[1])
+        self.update_countdown()
+        self.root.after(GUI_POLL_MS, self.poll)
+
+    def add_text(self, line):
+        if line.startswith(("[server error]", "[network]", "Cannot connect", "The server")):
+            self.last_problem = line.strip()
+        self.text.configure(state="normal")
+        self.text.insert("end", line.lstrip("\n") + "\n")
+        if int(self.text.index("end-1c").split(".")[0]) > GUI_MAX_LINES:
+            self.text.delete("1.0", "2.0")
+        self.text.configure(state="disabled")
+        self.text.see("end")
+
+    def on_message(self, msg):
+        s = self.snapshot
+        try:
+            mtype = msg.get("type")
+            if mtype == "WELCOME":
+                self.conn_var.set(f"伺服器 {self.session.peer}：已連線")
+                self.me_var.set(f"玩家：{self.session.name}（{printable(s['me'], 20)}，隊伍 {self.session.team}）")
+                self.status_var.set("已進入大廳，等待其他玩家加入")
+            elif mtype == "LOBBY":
+                self.status_var.set(f"大廳：{len(msg['players'])}/{printable(msg.get('max_players', '?'), 4)} "
+                                    f"位玩家，人數到齊就開始")
+            elif mtype == "GAME_START":
+                self.history_view.delete(*self.history_view.get_children())
+                self.out_status = {}
+                self.status_var.set(f"對局 {printable(s['game_id'], 20)} 開始：請選擇你的秘密數字")
+            elif mtype == "COMMITS":
+                self.status_var.set("所有人都已承諾，開始喊數" if not s["out_of_game"]
+                                    else "你沒有及時承諾，這一局只能觀戰")
+            elif mtype == "TURN":
+                who = "輪到你喊數！" if msg["guesser"] == s["me"] else f"{gui_name(s, msg['guesser'])} 喊數中…"
+                self.status_var.set(f"第 {printable(msg['turn_id'], 6)} 回合：{who}")
+            elif mtype == "GUESS_MADE":
+                self.status_var.set(f"第 {printable(msg['turn_id'], 6)} 回合：{gui_name(s, msg['guesser'])} 猜 "
+                                    f"{printable(msg['guess'], 8)}，等待所有人回報…")
+            elif mtype == "TURN_RESULT":
+                self.add_rows([turn_result_row(msg, s)])
+                for key, status in GUI_OUT_LISTS:
+                    for pid in msg.get(key, []):
+                        self.out_status[pid] = status
+                if s["me"] in self.out_status:
+                    self.status_var.set("你已出局，現在以觀戰者身分繼續看比賽")
+            elif mtype == "REVEALED":
+                self.add_rows([reveal_row(msg, s)], "reveal")
+            elif mtype == "GAME_OVER":
+                self.add_rows(ranking_rows(msg, s), "rank")
+                mine = next((r for r in msg["ranking"] if r.get("player") == s["me"]), None)
+                for r in msg["ranking"]:
+                    self.out_status[r.get("player")] = r.get("status")
+                place = ""
+                if mine is not None:
+                    rank = "-" if mine.get("rank") is None else printable(mine.get("rank"), 4)
+                    place = f"，你的名次：{rank}，{gui_word(GUI_STATUS, mine.get('status'))}"
+                self.status_var.set(f"遊戲結束：{gui_word(GUI_REASON, msg.get('reason'))}，"
+                                    f"共 {printable(msg.get('turns'), 6)} 回合{place}")
+            elif mtype == "ERROR":
+                self.status_var.set(f"伺服器錯誤 {printable(msg.get('code'), 30)}：{printable(msg.get('message'))}")
+        except (KeyError, TypeError, ValueError, AttributeError, IndexError):
+            pass  # a malformed message: the session already reported it in the message box
+        if s["secret"] is not None:
+            self.secret_var.set(f"你的秘密：{s['secret']}（只有你看得到）")
+        self.refresh_players()
+
+    def add_rows(self, rows, tag=""):
+        for row in rows:
+            self.history_view.insert("", "end", values=row, tags=(tag,) if tag else ())
+        self.history_view.yview_moveto(1.0)  # keep the newest row in view
+
+    def refresh_players(self):
+        s = self.snapshot
+        view = self.players_view
+        view.delete(*view.get_children())
+        pids = s["order"] or list(s["players"])
+        for pid in pids:
+            info = s["players"].get(pid, {})
+            if pid in self.out_status:  # just the word: the column is narrow
+                status = GUI_STATUS.get(self.out_status[pid], printable(self.out_status[pid], 10))
+            elif pid in s["alive"]:
+                status = "存活"
+            else:
+                status = "大廳" if not s["order"] else "-"
+            cands = s["cands"].get(pid, "-") if pid != s["me"] else "-"
+            team = printable(info.get("team", "?"), 20)
+            view.insert("", "end", values=(gui_name(s, pid), team, status, cands))
+
+    # ----- the action panel --------------------------------------------
+
+    def show_prompt(self, item):
+        for button in self.buttons:
+            button.destroy()
+        self.buttons = []
+        self.error_var.set("")
+        if item is None:
+            self.prompt = None
+            self.action_title.configure(text="目前不需要你動作")
+            self.action_hint.configure(text="選秘密數字、輪到你喊數、或需要回報時，這裡會出現輸入欄和按鈕。"
+                                            "被要求揭示時，秘密與鹽值會自動送出。")
+            self.entry.grid_remove()
+            self.countdown_var.set("")
+            return
+        seq, prompt, snapshot = item
+        self.prompt = (seq, prompt)
+        view = prompt_view(prompt, snapshot)
+        self.action_title.configure(text=view["title"])
+        self.action_hint.configure(text=view["hint"])
+        if view["entry"] is None:
+            self.entry.grid_remove()
+        else:
+            self.entry.grid()
+            self.entry_var.set(view["entry"])
+            self.entry.focus_set()
+            self.entry.select_range(0, "end")
+        for i, (label, value) in enumerate(view["buttons"]):
+            button = self.ttk.Button(self.buttons_frame, text=label, command=lambda v=value: self.answer(v))
+            button.grid(row=0, column=i, padx=(0, 8))
+            self.buttons.append(button)
+        self.update_countdown()
+
+    def answer(self, value):
+        """A button was pressed: check the text locally, then hand it to the session."""
+        if self.prompt is None:
+            return
+        seq, prompt = self.prompt
+        text = self.entry_var.get().strip() if value is None else value
+        problem = check_answer_text(prompt.kind, text) if value is None else ""
+        if problem:
+            self.error_var.set(problem)
+            return
+        self.error_var.set("")
+        for button in self.buttons:
+            button.state(["disabled"])  # until the session shows the next question
+        self.session.events.put(("answer", (seq, text)))
+
+    def press_first_button(self):
+        if self.buttons and not self.buttons[0].instate(["disabled"]):
+            self.buttons[0].invoke()
+
+    def update_countdown(self):
+        if self.prompt is None:
+            return
+        left = max(0.0, self.prompt[1].deadline - time.monotonic())
+        self.countdown_var.set(f"剩餘 {left:.0f} 秒")
+        self.countdown.configure(foreground="#b00020" if left <= 10 else "")
+
+    # ----- chat, quit, end ---------------------------------------------
+
+    def send_chat(self):
+        text = self.chat_var.get().strip()
+        if self.result is not None or not text:
+            return
+        if not is_valid_text(text, 1, 200):
+            self.error_var.set("聊天訊息最多 200 個字，且不能有控制字元")
+            return
+        self.session.events.put(("input", "/chat " + text))
+        self.chat_var.set("")
+
+    def on_close(self):
+        if self.result is not None:  # already disconnected
+            self.root.destroy()
+            return
+        if not self.session.game_over and not self.messagebox.askokcancel(
+                "離開遊戲", "遊戲還沒結束。現在離開等於斷線，會被判定棄權（FORFEIT）。確定要離開嗎？",
+                parent=self.root):
+            return
+        self.closing = time.monotonic()
+        self.session.events.put(("input", "/quit"))
+        self.close_when_done()
+
+    def close_when_done(self):
+        if self.result is not None or time.monotonic() - self.closing > 2.0:
+            self.root.destroy()
+        else:
+            self.root.after(50, self.close_when_done)
+
+    def on_done(self, code):
+        self.result = code
+        self.show_prompt(None)
+        self.conn_var.set(f"伺服器 {self.session.peer}：已離線")
+        self.chat_entry.state(["disabled"])
+        self.chat_button.state(["disabled"])
+        self.quit_button.configure(text="關閉視窗")
+        self.action_title.configure(text="連線已結束")
+        self.action_hint.configure(text="可以關閉視窗了。完整紀錄在訊息區與 client_logs/ 的日誌檔。")
+        if code == 0 or self.closing is not None:
+            return
+        self.status_var.set("連線中斷：" + (self.last_problem or "與伺服器的連線已結束"))
+        self.messagebox.showerror("連線結束", self.last_problem or "與伺服器的連線已結束，詳見訊息區。",
+                                  parent=self.root)
+
+
+def run_gui(args):
+    """`python bc.py gui`: the window.  Returns the session's exit code."""
+    if not check_identity(args):
+        return 2
+    try:
+        import tkinter as tk
+        from tkinter import font as tkfont
+        from tkinter import messagebox, ttk
+    except ImportError:
+        print("error: the GUI needs tkinter (Ubuntu/Debian: sudo apt install python3-tk). "
+              "The console client works without it: python bc.py client ...")
+        return 1
+    try:
+        root = tk.Tk()
+    except tk.TclError as exc:
+        print(f"error: cannot open a window ({exc}). Use the console client: python bc.py client ...")
+        return 1
+    session = GuiSession(args.host, args.port, args.name, args.team)
+    app = GuiApp(root, session, tk, ttk, tkfont, messagebox)
+    session.start()
+    try:
+        root.mainloop()
+    except KeyboardInterrupt:  # Ctrl+C in the terminal that started the window
+        session.events.put(("input", "/quit"))
+        time.sleep(0.3)  # give the network thread a moment to send BYE
+    return 1 if app.result is None else app.result
+
+
+# =====================================================================
+# 12. Command line interface                                     §5.2
 # =====================================================================
 
 
@@ -1920,7 +2478,7 @@ def build_parser():
         prog="bc.py",
         description="Multiplayer Bulls & Cows over TCP (protocol BC/1.0).",
     )
-    sub = parser.add_subparsers(dest="command", required=True, metavar="{server,client,ai}")
+    sub = parser.add_subparsers(dest="command", required=True, metavar="{server,client,ai,gui}")
 
     s = sub.add_parser("server", help="run the game server (referee)",
                        description="Run the BC/1.0 game server.")
@@ -1946,7 +2504,8 @@ def build_parser():
                    help="number of games to host, 0 = unlimited (default: %(default)s)")
     s.add_argument("--log-dir", default="logs", help="directory for server logs (default: %(default)s)")
 
-    for name, kind in (("client", "a human player (console)"), ("ai", "an automatic AI player")):
+    for name, kind in (("client", "a human player (console)"), ("ai", "an automatic AI player"),
+                       ("gui", "a human player in a window (tkinter; optional, not graded)")):
         p = sub.add_parser(name, help=f"connect as {kind}",
                            description=f"Connect to a BC/1.0 server as {kind}.")
         p.add_argument("--host", required=True, help="server address")
@@ -2030,7 +2589,7 @@ def run_ai(args):
 def main(argv=None):
     force_utf8_console()
     args = build_parser().parse_args(argv)
-    commands = {"server": run_server, "client": run_client, "ai": run_ai}
+    commands = {"server": run_server, "client": run_client, "ai": run_ai, "gui": run_gui}
     return commands[args.command](args)
 
 

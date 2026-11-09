@@ -13,6 +13,7 @@ python bc.py server [--host 0.0.0.0] [--port 5040] [--players 2] [--bots 0]
                     [--games 1] [--log-dir logs]
 python bc.py client --host HOST [--port 5040] --name NAME [--team G00]
 python bc.py ai     --host HOST [--port 5040] --name NAME [--team G00] [--quiet] [--strategy v2]
+python bc.py gui    --host HOST [--port 5040] --name NAME [--team G00]   # optional window, not graded
 ```
 
 `python bc.py <subcommand> --help` lists every option with its default. Timeouts are in seconds and may be
@@ -54,6 +55,42 @@ folder. That folder is separate from the server's `--log-dir` and ignored by git
 
 Exit code: 0 after a normal `GAME_OVER`, 1 after a fatal `ERROR` or a lost connection, 2 for a bad
 `--name`/`--team`.
+
+## Window (GUI, optional)
+
+```
+python bc.py gui --host 127.0.0.1 --port 5040 --name GXX-小明 --team GXX
+```
+
+`gui` opens a window for the same human player, with Traditional Chinese labels. **The console `client`
+above stays the graded interface (§5.4)**; the window is an extra for demos and practice. It has the same
+options as `client` and needs tkinter (Windows and macOS Python include it; on Ubuntu/Debian:
+`sudo apt install python3-tk`). Without tkinter or a display it prints an error and exits with 1. The
+`server`, `client` and `ai` commands do not use tkinter and are unchanged.
+
+What the window shows and does:
+
+- **Top:** the server and connection state, your player id, your secret, and one status line (lobby,
+  whose turn it is, waiting for answers, your final rank).
+- **玩家:** every player with team, state (大廳 / 存活 / 被猜中 / 棄權 / 取消資格) and, for opponents, how many
+  secrets are still possible (`/cands`).
+- **對局紀錄:** every turn: guesser, guess, each player's answer, who is out; then every reveal with its
+  verdict, and the final ranking.
+- **你的動作:** appears only when you must act, with a countdown:
+  - **secret:** 4 digits or the 隨機 button. The commit is sent automatically; a random secret is used when
+    the time is up.
+  - **guess:** shown only when it is your turn.
+  - **feedback:** the honest answer is prefilled. If you change it, you must confirm the different answer
+    first, because a wrong one leads to DQ at the reveal.
+  - Input is checked in the window before anything is sent. A late answer to a closed question is never sent.
+- **Reveal** is automatic, as in the console client. The **訊息** box shows the same lines the console client
+  prints. Chat and **離開遊戲** are at the bottom. Leaving during a game asks first, because it counts as a
+  disconnect (FORFEIT).
+
+How it is built: `GuiSession` is a `HumanClient`, so the protocol code is the same as the console client's,
+and there is no second network stack. It runs on a background thread and does all the sending. The Tk
+window only reads a queue of events (every 100 ms with `after()`) and puts the user's answers into the
+session's event queue, so the window never blocks on the network. It logs to `client_logs/` like `client`.
 
 ## AI player
 
@@ -201,7 +238,8 @@ python -m unittest discover -s tests -v  # standard library only
 | 8. Human client | `HumanClient`: input thread, prompts with deadlines, prefilled feedback plus confirmation | §5.4 |
 | 9. AI | `pick_target`, `most_parts_guess`, `choose_guess_v1` (v1); `answer_entropy`, `entropy_guess`, `choose_guess_v2` (v2); `AIPlayer` | §5.5 |
 | 10. Server | `GameServer` (lobby, state machine, timeouts, reveals, ranking, bots, logs), `Connection` (bounded send queue), `ServerPlayer`, `hello_error`, `compute_ranking` | §5.3, §10–§14, §16.1 |
-| 11. CLI | `build_parser` with the exact §5.2 options; `server_arg_problems` | §5.2 |
+| 11. GUI (optional) | `GuiSession` (a `HumanClient` on a background thread that talks to the window through queues), `GuiApp` (tkinter widgets), `run_gui`; tested helpers `prompt_view`, `check_answer_text`, `turn_result_row`, `reveal_row`, `ranking_rows` | extra |
+| 12. CLI | `build_parser` with the exact §5.2 options (plus `gui`); `server_arg_problems` | §5.2 |
 
 ## Course materials
 
