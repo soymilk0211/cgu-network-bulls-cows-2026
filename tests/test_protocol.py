@@ -315,6 +315,10 @@ class CliTests(unittest.TestCase):
         a = self.parse("ai", "--host", "h", "--port", "6000", "--name", "bot", "--team", "G07", "--quiet")
         self.assertEqual((a.host, a.port, a.name, a.team, a.quiet), ("h", 6000, "bot", "G07", True))
         self.assertFalse(self.parse("ai", "--host", "h", "--name", "n").quiet)
+        self.assertEqual(self.parse("ai", "--host", "h", "--name", "n").strategy, bc.DEFAULT_STRATEGY)
+        for strategy in ("v1", "v2"):
+            self.assertEqual(self.parse("ai", "--host", "h", "--name", "n", "--strategy", strategy).strategy,
+                             strategy)
 
     def test_client_requires_host_and_name(self):
         with self.assertRaises(SystemExit):
@@ -329,7 +333,7 @@ class CliTests(unittest.TestCase):
                           "--feedback-timeout", "--commit-timeout", "--reveal-timeout",
                           "--max-turns", "--max-skips", "--games", "--log-dir"],
             ("client",): ["--host", "--port", "--name", "--team"],
-            ("ai",): ["--host", "--port", "--name", "--team", "--quiet"],
+            ("ai",): ["--host", "--port", "--name", "--team", "--quiet", "--strategy"],
         }
         for sub, options in expected.items():
             with self.subTest(sub=sub):

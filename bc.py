@@ -18,7 +18,7 @@ Layout of this file (search for the "=====" banners):
     6. Client-side JSON Lines log           (§5.6)
     7. PlayerSession: connection + game state shared by client and AI (§11-12)
     8. HumanClient: console player          (§5.4)
-    9. AIPlayer: automatic player, v1 most-parts strategy (§5.5)
+    9. AIPlayer: automatic player, v1 most-parts / v2 entropy (§5.5)
    10. GameServer: the referee, asyncio     (§5.3, §10-§14)
    11. Command line interface               (§5.2)
 """
@@ -28,6 +28,7 @@ import asyncio
 import hashlib
 import itertools
 import json
+import math
 import os
 import queue
 import random
@@ -38,6 +39,7 @@ import sys
 import threading
 import time
 import unicodedata
+from collections import Counter
 from dataclasses import dataclass, field
 
 # =====================================================================
@@ -1011,6 +1013,8 @@ class HumanClient(PlayerSession):
 # possible ("candidates").  PlayerSession.on_turn_result already shrinks these
 # lists with EVERY public result, not only our own guesses (§16.3.8).
 #
+# Two strategies, chosen with `ai --strategy` (v2 is described further below).
+#
 # v1 strategy (the spec's baseline, Kooi 2005 "most parts"):
 #   1. target = the alive opponent with the fewest candidates;
 #   2. guess  = the target candidate that splits the target's candidates into
@@ -1076,16 +1080,106 @@ def choose_guess_v1(cands, budget=AI_TIME_BUDGET, rng=random):
     return most_parts_guess(cands[target], budget, rng)
 
 
+# v2 strategy (issue #11): weighted multi-opponent entropy.
+#   1. target = the opponent with the fewest candidates, as in v1.  If only one
+#      candidate is left, we know its secret: guess it at once.
+#   2. Every guess in a pool gets the score
+#          H(target) + AI_V2_WEIGHT * (sum of H(o) for the other alive opponents o)
+#      H(x) is the entropy, in bits, of the answers opponent x could give.  All
+#      alive opponents answer every guess, so one guess teaches us about
+#      everybody; v1 only looks at the target.
+#   3. The pool: the target's candidates first (only they can hit the target, and
+#      on equal scores the first guess wins), then some candidates of each other
+#      opponent, then some random numbers (a number nobody can have may still
+#      split the lists better).
+# Big lists are estimated on random samples.  If the scoring does not finish in
+# its share of the time budget, v1 decides with the time that is left.
+
+AI_V2_WEIGHT = 0.5  # weight of each non-target opponent's entropy
+AI_V2_SAMPLE = 200  # secrets per opponent used to estimate an entropy
+AI_V2_POOL = 150  # target candidates scored as guesses
+AI_V2_EXTRA = 75  # candidates of each other opponent, and random numbers, added to the pool
+AI_V2_SHARE = 0.6  # v2 may use this part of the budget; on a timeout v1 gets the rest
+AI_STRATEGIES = ("v1", "v2")
+DEFAULT_STRATEGY = "v2"  # chosen with tools/ai_experiment.py (see the README)
+
+
+def answer_entropy(guess, secrets_list):
+    """Entropy in bits of the (a, b) answers `guess` gets from these secrets.
+
+    0 means every secret gives the same answer, so we learn nothing.  The more
+    evenly the secrets spread over different answers, the higher the entropy
+    and the fewer secrets stay possible on average after the answer.
+    `secrets_list` must not be empty.
+    """
+    n = len(secrets_list)
+    counts = Counter([score(guess, s) for s in secrets_list])
+    return math.log2(n) - sum(c * math.log2(c) for c in counts.values()) / n
+
+
+def limited(items, limit, rng=random):
+    """A list of `items`, or a random sample of `limit` of them if there are more."""
+    return list(items) if len(items) <= limit else rng.sample(list(items), limit)
+
+
+def entropy_guess(cands, target, deadline, rng=random):
+    """The v2 choice: the pool guess with the best weighted entropy.
+
+    Returns None if time.monotonic() passes `deadline` before every guess in
+    the pool is scored.
+    """
+    others = [c for pid, c in cands.items() if pid != target and c]  # skip empty lists
+    target_sample = limited(cands[target], AI_V2_SAMPLE, rng)
+    other_samples = [limited(c, AI_V2_SAMPLE, rng) for c in others]
+    pool = limited(cands[target], AI_V2_POOL, rng)
+    for c in others:
+        pool += limited(c, AI_V2_EXTRA, rng)
+    pool += rng.sample(ALL_NUMBERS, AI_V2_EXTRA)
+    best, best_score = None, -1.0
+    for guess in dict.fromkeys(pool):  # drops repeated guesses, keeps the order
+        if time.monotonic() > deadline:
+            return None
+        value = answer_entropy(guess, target_sample)
+        value += AI_V2_WEIGHT * sum(answer_entropy(guess, s) for s in other_samples)
+        if value > best_score:
+            best, best_score = guess, value
+    return best
+
+
+def choose_guess_v2(cands, budget=AI_TIME_BUDGET, rng=random, stats=None):
+    """v2: weighted multi-opponent entropy, with v1 as the fallback on a timeout.
+
+    If `stats` is a dict, stats["fallback"] is set to True when v1 decided.
+    """
+    start = time.monotonic()
+    target = pick_target(cands)
+    if target is None:
+        return rng.choice(ALL_NUMBERS)
+    if len(cands[target]) == 1:
+        return cands[target][0]  # we know the target's secret
+    if len(cands[target]) == len(ALL_NUMBERS):
+        return rng.choice(ALL_NUMBERS)  # no information yet: all guesses are equal
+    guess = entropy_guess(cands, target, start + budget * AI_V2_SHARE, rng)
+    if guess is None:  # out of time: v1 with what is left of the budget
+        if stats is not None:
+            stats["fallback"] = True
+        return choose_guess_v1(cands, max(0.0, budget - (time.monotonic() - start)), rng)
+    return guess
+
+
 class AIPlayer(PlayerSession):
-    """Fully automatic player: random secret, instant feedback and reveal, v1 guesses."""
+    """Fully automatic player: random secret, instant feedback and reveal, v1 or v2 guesses."""
 
     kind = "ai"
     # With --quiet only lines starting like this are printed.
     QUIET_KEEP = ("[server error]", "[network]", "[warning]", "Cannot connect", "The server",
                   "\n=====")
 
-    def __init__(self, *args, quiet=False, **kwargs):
+    def __init__(self, *args, quiet=False, strategy=DEFAULT_STRATEGY, **kwargs):
+        if strategy not in AI_STRATEGIES:
+            raise ValueError(f"unknown AI strategy {strategy!r}")
         self.quiet = quiet
+        self.strategy = strategy
         super().__init__(*args, **kwargs)
 
     def say(self, text):
@@ -1103,15 +1197,20 @@ class AIPlayer(PlayerSession):
         start = time.monotonic()
         # Stay far below the guess timeout, even with very short test timeouts.
         budget = min(AI_TIME_BUDGET, self.rules["guess_timeout"] * 0.25)
+        stats = {}
         try:
-            guess = choose_guess_v1(self.cands, budget)
+            if self.strategy == "v2":
+                guess = choose_guess_v2(self.cands, budget, stats=stats)
+            else:
+                guess = choose_guess_v1(self.cands, budget)
         except Exception as exc:  # noqa: BLE001 - a bug must never cost us the turn
             self.say(f"[warning] strategy failed ({type(exc).__name__}: {exc}); guessing at random")
             guess = None
         if not is_valid_number(guess):
             guess = secrets.choice(ALL_NUMBERS)
         self.send_guess(turn_id, guess)
-        self.say(f"AI guess {guess} (took {time.monotonic() - start:.2f}s; "
+        how = "v2 ran out of time, v1 decided" if stats.get("fallback") else self.strategy
+        self.say(f"AI guess {guess} ({how}, took {time.monotonic() - start:.2f}s; "
                  f"target sizes: {sorted(len(c) for c in self.cands.values())})")
 
 
@@ -1856,6 +1955,9 @@ def build_parser():
         p.add_argument("--team", default="G00", help="team / group id (default: %(default)s)")
         if name == "ai":
             p.add_argument("--quiet", action="store_true", help="print less output")
+            p.add_argument("--strategy", choices=AI_STRATEGIES, default=DEFAULT_STRATEGY,
+                           help="how to choose guesses: v1 = most parts (the spec's baseline), "
+                                "v2 = weighted multi-opponent entropy (default: %(default)s)")
     return parser
 
 
@@ -1921,7 +2023,8 @@ def run_client(args):
 def run_ai(args):
     if not check_identity(args):
         return 2
-    return AIPlayer(args.host, args.port, args.name, args.team, quiet=args.quiet).run()
+    return AIPlayer(args.host, args.port, args.name, args.team, quiet=args.quiet,
+                    strategy=args.strategy).run()
 
 
 def main(argv=None):
