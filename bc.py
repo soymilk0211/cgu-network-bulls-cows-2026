@@ -18,7 +18,8 @@ Layout of this file (search for the "=====" banners):
     6. Client-side JSON Lines log           (§5.6)
     7. PlayerSession: connection + game state shared by client and AI (§11-12)
     8. HumanClient: console player          (§5.4)
-    9. Command line interface               (§5.2)
+    9. AIPlayer: automatic player, v1 most-parts strategy (§5.5)
+   10. Command line interface               (§5.2)
 """
 
 import argparse
@@ -27,6 +28,7 @@ import itertools
 import json
 import os
 import queue
+import random
 import re
 import secrets
 import socket
@@ -1000,7 +1002,119 @@ class HumanClient(PlayerSession):
 
 
 # =====================================================================
-# 9. Command line interface                                      §5.2
+# 9. AI player                                                   §5.5
+# =====================================================================
+#
+# The AI keeps, for every alive opponent, the list of secrets that are still
+# possible ("candidates").  PlayerSession.on_turn_result already shrinks these
+# lists with EVERY public result, not only our own guesses (§16.3.8).
+#
+# v1 strategy (the spec's baseline, Kooi 2005 "most parts"):
+#   1. target = the alive opponent with the fewest candidates;
+#   2. guess  = the target candidate that splits the target's candidates into
+#               the most different (a, b) answers.
+# Big candidate lists are estimated on a random sample, and the search stops
+# at a time budget, so a decision never takes long.
+
+AI_TIME_BUDGET = 1.0  # seconds per guess at most (spec: "within 2 s", §5.5)
+AI_SAMPLE_SIZE = 500  # secrets used to estimate the parts of a big candidate list
+# The strategy uses `random` only to shuffle and sample - nothing secret.
+# Our own secret and salt always come from `secrets` (§16.3.7).
+
+
+def pick_target(cands):
+    """The opponent with the fewest candidates (ties: smallest player id).
+
+    cands: {player_id: [possible secrets]}.  Empty lists are skipped (that
+    player lied and will be disqualified).  Returns None if nobody is left.
+    """
+    options = [pid for pid, c in cands.items() if c]
+    if not options:
+        return None
+    return min(options, key=lambda pid: (len(cands[pid]), pid))
+
+
+def count_parts(guess, secrets_list):
+    """How many different (a, b) answers `guess` gets from these secrets."""
+    return len({score(guess, s) for s in secrets_list})
+
+
+def most_parts_guess(cands, budget=AI_TIME_BUDGET, rng=random):
+    """Kooi's most-parts choice among `cands` (§5.5), within `budget` seconds.
+
+    Candidates are tried in random order; when time runs out we return the
+    best one found so far.  14 parts is the maximum, so we stop early there.
+    """
+    if len(cands) <= 2:  # nothing to split: just try to hit it now
+        return cands[0]
+    if len(cands) == len(ALL_NUMBERS):  # no information yet: all guesses are equal
+        return rng.choice(cands)
+    deadline = time.monotonic() + budget
+    sample = cands if len(cands) <= AI_SAMPLE_SIZE else rng.sample(cands, AI_SAMPLE_SIZE)
+    best_parts = min(len(LEGAL_FEEDBACK), len(sample))  # the best that is possible
+    order = list(cands)
+    rng.shuffle(order)
+    best, best_count = order[0], 0
+    for guess in order:
+        parts = count_parts(guess, sample)
+        if parts > best_count:
+            best, best_count = guess, parts
+            if parts == best_parts:
+                break
+        if time.monotonic() > deadline:
+            break
+    return best
+
+
+def choose_guess_v1(cands, budget=AI_TIME_BUDGET, rng=random):
+    """v1: most-parts guess for the opponent with the fewest candidates."""
+    target = pick_target(cands)
+    if target is None:
+        return rng.choice(ALL_NUMBERS)
+    return most_parts_guess(cands[target], budget, rng)
+
+
+class AIPlayer(PlayerSession):
+    """Fully automatic player: random secret, instant feedback and reveal, v1 guesses."""
+
+    kind = "ai"
+    # With --quiet only lines starting like this are printed.
+    QUIET_KEEP = ("[server error]", "[network]", "[warning]", "Cannot connect", "The server",
+                  "\n=====")
+
+    def __init__(self, *args, quiet=False, **kwargs):
+        self.quiet = quiet
+        super().__init__(*args, **kwargs)
+
+    def say(self, text):
+        if not self.quiet or text.startswith(self.QUIET_KEEP):
+            self.out(f"[{printable(self.name, 20)}] {text.lstrip()}")
+
+    def begin_commit(self):
+        self.send_commit(secrets.choice(ALL_NUMBERS))  # unpredictable secret
+
+    def begin_feedback(self, turn_id, guesser, guess):
+        # Always the honest answer, sent at once (§5.5).
+        self.send_feedback(turn_id, *score(guess, self.secret))
+
+    def begin_guess(self, turn_id):
+        start = time.monotonic()
+        # Stay far below the guess timeout, even with very short test timeouts.
+        budget = min(AI_TIME_BUDGET, self.rules["guess_timeout"] * 0.25)
+        try:
+            guess = choose_guess_v1(self.cands, budget)
+        except Exception as exc:  # noqa: BLE001 - a bug must never cost us the turn
+            self.say(f"[warning] strategy failed ({type(exc).__name__}: {exc}); guessing at random")
+            guess = None
+        if not is_valid_number(guess):
+            guess = secrets.choice(ALL_NUMBERS)
+        self.send_guess(turn_id, guess)
+        self.say(f"AI guess {guess} (took {time.monotonic() - start:.2f}s; "
+                 f"target sizes: {sorted(len(c) for c in self.cands.values())})")
+
+
+# =====================================================================
+# 10. Command line interface                                     §5.2
 # =====================================================================
 
 
@@ -1080,8 +1194,9 @@ def run_client(args):
 
 
 def run_ai(args):
-    print("ai: not implemented yet (issue #3)")
-    return 1
+    if not check_identity(args):
+        return 2
+    return AIPlayer(args.host, args.port, args.name, args.team, quiet=args.quiet).run()
 
 
 def main(argv=None):
