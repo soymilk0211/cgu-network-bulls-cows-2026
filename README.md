@@ -79,10 +79,25 @@ slowest decision took 0.17 s.
 
 ## Tests
 
+Run these from the repository root. Each command runs all three test files (`tests/test_protocol.py`,
+`tests/test_client.py`, `tests/test_ai.py`):
+
 ```
-python -m pytest -q                      # if pytest is installed
+python -m pytest -q                      # needs pytest (a development tool only)
 python -m unittest discover -s tests -v  # standard library only
 ```
+
+`tests/` is a plain folder, not a package. That is why `python -m unittest discover -s tests -t .` fails with
+"Start directory is not importable", and a bare `python -m unittest` finds no tests. Use the commands above.
+
+## Team workflow
+
+The rules for teammates and their AI coding tools are in [`AGENTS.md`](AGENTS.md). It covers:
+- who owns which part of `bc.py`;
+- the shared core and its interface contracts;
+- one issue = one branch = one PR, with no direct pushes to `main` and no self-merges;
+- running all tests before opening a PR;
+- stdlib only, following the BC/1.0 spec, and never committing `course/`, logs, secrets or student IDs.
 
 ## Code map (`bc.py`)
 
@@ -103,3 +118,54 @@ python -m unittest discover -s tests -v  # standard library only
 
 The teacher's spec PDF, reference server and `bc_selftest.py` are private course files. Keep them in a local
 `course/` folder, which is listed in `.gitignore`. Never commit them.
+
+## 繁體中文摘要
+
+**這是什麼**：多人幾A幾B 連線對戰（協定 BC/1.0）。所有程式都在根目錄的 `bc.py`，只用 Python 3.10 以上的標準
+函式庫，不需安裝任何套件。
+
+**怎麼執行**（`python bc.py <子命令> --help` 可看全部選項與預設值）：
+
+```
+python bc.py client --host 伺服器位址 --port 5040 --name G00-小明 --team G00   # 人類玩家
+python bc.py ai     --host 伺服器位址 --port 5040 --name G00-AI   --team G00   # AI（可加 --quiet）
+python bc.py server ...                                                       # 伺服器：尚未完成（#4）
+```
+
+- **人類玩家**：
+  - 開局時輸入四位不重複的秘密數字，或直接按 Enter 隨機產生；承諾值（雜湊）會自動送出。
+  - 輪到你時才會要求喊數。
+  - 別人喊數後，程式會預先算好幾A幾B，按 Enter 就送出；若要改成別的值，必須再輸入 `yes` 確認。
+  - 被要求揭示時，程式會自動、立即送出秘密與鹽值。
+  - **回報逾時＝棄權**；喊數逾時只會跳過該回合。
+  - 隨時可用的指令：`/chat 文字`、`/cands`、`/quit`、`/help`。
+- **AI**：全自動。它會替每位對手記住還可能的答案，並用每一回合公開的結果刪減；輪到時鎖定候選最少的對手，
+  用「最多劃分」（most parts）挑喊數。
+- **日誌**：client 與 ai 的日誌寫在 `client_logs/`。這個資料夾不是伺服器的 `--log-dir`，也不會進 git。
+
+**怎麼測試**（在儲存庫根目錄執行，三個測試檔都會跑到）：
+
+```
+python -m pytest -q
+python -m unittest discover -s tests -v
+```
+
+注意：`-t .` 的寫法與單獨的 `python -m unittest` 都無法使用。
+
+**分工與流程**（詳見 [`AGENTS.md`](AGENTS.md)，請各位與自己的 AI 工具都先讀它）：
+
+- **三個負責區域**（負責人待填）：A 伺服器（#4）、B 人類玩家（#2）、C AI（#3）。共用核心（收發框架、驗證、
+  計分、承諾/揭示驗證、`PlayerSession`、日誌、命令列）沒有單一負責人。要改共用核心的介面或行為時：
+  1. 先開 issue；
+  2. 在同一個 PR 更新所有呼叫處與測試；
+  3. 在 PR 裡通知其他負責人。
+- **一個 issue＝一個分支（`issue-N-簡短名稱`）＝一個 PR**，PR 內寫 `Closes #N`。依賴的 PR 還沒合併時，
+  就從它的分支開分支，並在 PR 說明。
+- **不直接推到 `main`，也不合併自己的 PR**，由另一位組員審查並合併。PR 要小，一次只做一件事。
+- **開 PR 前**：先跑完上面的測試與三個 `--help`，全部通過才開；PR 內容要寫改了什麼、並貼上測試結果。
+- **硬性規定**：
+  - 只用標準函式庫（Python 3.10+）。
+  - 完全依照 BC/1.0 規範，不自行改動訊息欄位或命令列選項。
+  - 絕不提交 `course/`（老師的檔案）、真實對局日誌、密碼金鑰或學號。
+  - 穩定優先於強度。
+  - 每位組員都要能解釋每一段程式；使用生成式 AI 工具要在報告中聲明。
