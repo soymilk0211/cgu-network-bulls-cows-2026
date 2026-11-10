@@ -46,6 +46,38 @@ Everything is in one file, `bc.py`, which uses only the Python standard library 
 - 遊戲中途關掉視窗，會先問你是否確定，因為中途離開會被判定棄權（FORFEIT）。
 - 課堂評分用的仍是文字版 `bc.py client`；要連別人的伺服器，請照下面的 Usage 執行 `client` 或 `gui`。
 
+## 連到別人／開房給別人
+
+「一鍵開始」只在自己的電腦上玩（127.0.0.1）。要和同一個 Wi-Fi／區域網路的朋友對戰，用這兩組啟動檔：
+
+| 我要… | macOS（雙擊） | Windows（雙擊） |
+|---|---|---|
+| **開房**，讓朋友連進來 | `host.command` | `host.bat` |
+| **連到**朋友開的房 | `join.command` | `join.bat` |
+
+**開房（host）**：依序問你 *總玩家數*（2–6，Enter = 3，伺服器最多 6 位）、*AI 數量*（0 到 總數−1，Enter = 0；
+AI 也算在總玩家數裡，至少留一位給真人）、*你的名字*。接著確認連接埠 **5040** 沒被占用（被占用會直接說明並停止），
+在背景啟動 `bc.py server --host 0.0.0.0 --port 5040 --players N --bots B --games 0`（輸出在 `logs/host-server.txt`），
+**印出這台電腦的區域網路 IP**，再打開你自己的遊戲視窗（`--host 127.0.0.1`）。關掉視窗就會停止伺服器，
+朋友也會斷線。第一次會跳出防火牆詢問：Windows 請勾「私人網路」再按「允許存取」，macOS 請按「允許」，否則朋友連不進來。
+
+**連線（join）**：依序問 *主機 IP*（必填，向開房的人要）、*連接埠*（Enter = 5040）、*名字*、*隊伍*（Enter = G00），
+先檢查連得上主機（連不上會列出可能原因），再打開遊戲視窗。
+
+不想用啟動檔，也可以手動執行：
+
+```
+# 開房（朋友連你的 IP；--games 0 讓「再玩一局」能用）
+python bc.py server --host 0.0.0.0 --port 5040 --players 3 --bots 0 --games 0
+python bc.py gui --host 127.0.0.1 --port 5040 --name 我的名字 --team G00
+
+# 連到別人
+python bc.py gui --host 192.168.1.23 --port 5040 --name 我的名字 --team G00
+```
+
+如果 5040 被系統程式占用（Windows 常見），手動開在別的連接埠（例如 `--port 5600`），朋友用 `join` 時輸入同一個連接埠。
+這些啟動檔和 `start.command`／`start.bat` 一樣，只呼叫 `bc.py`，沒有改動它。
+
 ## Usage
 
 ```
