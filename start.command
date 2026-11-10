@@ -3,7 +3,8 @@
 #
 # 1. 找一個有 tkinter 的 Python 3.10+（先試 python3，再試 python3.13 … python3.10、python）。
 # 2. 問你的名字（直接按 Enter = Player），隊伍用 G00。
-# 3. 在背景啟動伺服器：你 + 2 個 AI，共 3 位玩家，只在本機 127.0.0.1:5040。
+# 3. 在背景啟動伺服器（--games 0：一局結束後繼續開著，讓視窗的「再玩一局」能重新連線）：
+#    你 + 2 個 AI，共 3 位玩家，只在本機 127.0.0.1:5040。
 # 4. 等連接埠 5040 可以連線後，打開遊戲視窗（bc.py gui）。
 # 5. 關掉遊戲視窗後，自動停止伺服器（和它的 AI）。
 #
@@ -68,10 +69,10 @@ done
 # ---- 3. Server in the background --------------------------------------------
 mkdir -p logs
 SERVER_LOG="logs/launcher-server.txt"
-"$PY" bc.py server --host 127.0.0.1 --port "$PORT" --players 3 --bots 2 >"$SERVER_LOG" 2>&1 &
+"$PY" bc.py server --host 127.0.0.1 --port "$PORT" --players 3 --bots 2 --games 0 >"$SERVER_LOG" 2>&1 &
 SERVER_PID=$!
 
-stop_server() {  # only if that PID is still our server (it ends by itself after one game)
+stop_server() {  # only if that PID is still our server (with --games 0 it keeps hosting until we stop it)
     if ps -p "$SERVER_PID" -o command= 2>/dev/null | grep -q "bc.py server"; then
         pkill -TERM -P "$SERVER_PID" 2>/dev/null  # the AI players started by the server
         kill -TERM "$SERVER_PID" 2>/dev/null

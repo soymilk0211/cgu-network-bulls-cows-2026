@@ -19,13 +19,14 @@ Everything is in one file, `bc.py`, which uses only the Python standard library 
 1. **找 Python**：要 3.10 以上、而且有 tkinter。macOS 依序試 `python3`、`python3.13` … `python3.10`、`python`；
    Windows 依序試 `python3`、`py -3`、`python`。
 2. **問你的名字**：1–20 個字，直接按 Enter 就用 `Player`；隊伍固定是 `G00`。
-3. **在背景啟動伺服器**：`bc.py server --host 127.0.0.1 --port 5040 --players 3 --bots 2`。只開在本機
+3. **在背景啟動伺服器**：`bc.py server --host 127.0.0.1 --port 5040 --players 3 --bots 2 --games 0`。只開在本機
    127.0.0.1，所以防火牆不會跳出詢問，別台電腦也連不進來。
 4. **等連接埠 5040 可以連線**，再打開遊戲視窗：`bc.py gui --host 127.0.0.1 --port 5040 --name 你的名字 --team G00`。
    視窗怎麼玩，請看下面的「Window (GUI, optional)」。
 5. **關掉遊戲視窗後**，自動停止伺服器和它的 2 個 AI。
 
-伺服器只辦一局；想再玩一局，關掉視窗後再雙擊一次。伺服器的畫面輸出存在 `logs/launcher-server.txt`，對局日誌在
+`--games 0` 讓伺服器一局結束後繼續開著：打完一局（`GAME_OVER`）後，視窗的「再玩一局」按鈕會重新連到同一個大廳；
+關掉視窗才會停止伺服器。伺服器的畫面輸出存在 `logs/launcher-server.txt`，對局日誌在
 `logs/`，你的日誌在 `client_logs/`，這些都不會進 git。啟動檔只是執行 `bc.py` 的指令，沒有改動 `bc.py`。
 
 **第一次使用**
@@ -197,6 +198,7 @@ below 2 s.
 ```
 python bc.py server --port 5040 --players 4 --bots 1          # 4 players, 1 of them our AI
 python bc.py server --players 2 --bots 2 --log-dir logs       # hosts one AI-only game and exits
+python bc.py server --players 3 --bots 2 --games 0            # keeps hosting game after game (needed for the GUI 再玩一局)
 ```
 
 - **Lobby:** the server listens on `--host` (default `0.0.0.0`, all IPv4 addresses) and waits for `--players`

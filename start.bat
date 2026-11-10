@@ -1,7 +1,7 @@
 @echo off
 rem One-click start for Windows: double-click this file. See README.
 rem Python 3.10+ with tkinter (python3, then py -3, then python) -> your name ->
-rem bc.py server (you + 2 AI players, only 127.0.0.1:5040) in the background ->
+rem bc.py server --games 0 (you + 2 AI players, only 127.0.0.1:5040, keeps hosting for the GUI replay button) in the background ->
 rem wait until port 5040 accepts -> bc.py gui -> when the window closes, stop the server.
 rem Nothing before "chcp 65001" may contain non-ASCII text.
 cd /d "%~dp0"
@@ -48,7 +48,7 @@ if not exist logs mkdir logs
 rem The helper prints the server's PID and program name, e.g. "1234 python.exe".
 set "SERVER_PID="
 set "SERVER_EXE="
-for /f "usebackq tokens=1*" %%P in (`%PY% -c "import os, subprocess, sys; log = open(sys.argv[2], 'w', encoding='utf-8'); p = subprocess.Popen([sys.executable, 'bc.py', 'server', '--host', '127.0.0.1', '--port', sys.argv[1], '--players', '3', '--bots', '2'], stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT); print(p.pid, os.path.basename(sys.executable))" %PORT% %SERVER_LOG%`) do (
+for /f "usebackq tokens=1*" %%P in (`%PY% -c "import os, subprocess, sys; log = open(sys.argv[2], 'w', encoding='utf-8'); p = subprocess.Popen([sys.executable, 'bc.py', 'server', '--host', '127.0.0.1', '--port', sys.argv[1], '--players', '3', '--bots', '2', '--games', '0'], stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT); print(p.pid, os.path.basename(sys.executable))" %PORT% %SERVER_LOG%`) do (
     set "SERVER_PID=%%P"
     set "SERVER_EXE=%%Q"
 )
@@ -108,7 +108,7 @@ rem errorlevel 0 if something accepts connections on 127.0.0.1:PORT
 exit /b %errorlevel%
 
 :stop_server
-rem The server ends by itself after its one game, and Windows reuses PIDs, so stop it only if that
+rem With --games 0 the server keeps hosting until we stop it, and Windows reuses PIDs, so stop it only if that
 rem PID is still our server program.  /T also stops the AI players it started.
 call :server_running
 if not errorlevel 1 taskkill /F /T /PID %SERVER_PID% >nul 2>&1
