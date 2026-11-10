@@ -1881,21 +1881,24 @@ class GameServer:
         self.say(f"{PROTOCOL_VERSION} server listening on {self.args.host}:{self.port}")
         self.start_console()
         try:
-            async with listener:
-                while self.args.games == 0 or self.games_played < self.args.games:
-                    try:
-                        await self.run_game()
-                    except asyncio.CancelledError:
-                        raise
-                    except Exception as exc:  # noqa: BLE001 - report a bug, keep hosting
-                        self.say(f"internal error, game abandoned: {type(exc).__name__}: {exc}")
-                        for p in self.players.values():
-                            p.conn.close()
-                    self.games_played += 1
-                    await self.end_game()
+            while self.args.games == 0 or self.games_played < self.args.games:
+                try:
+                    await self.run_game()
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:  # noqa: BLE001 - report a bug, keep hosting
+                    self.say(f"internal error, game abandoned: {type(exc).__name__}: {exc}")
+                    for p in self.players.values():
+                        p.conn.close()
+                self.games_played += 1
+                await self.end_game()
         except asyncio.CancelledError:
             self.say("stopping")
         finally:
+            # Stop listening, but do not `await listener.wait_closed()` (what `async with listener` does):
+            # on Windows with Python 3.12 a connection reset while closing skips asyncio's bookkeeping, and
+            # wait_closed() then never returns, so a server with --games N would not exit after game N.
+            listener.close()
             for p in self.players.values():
                 p.conn.close()
             for proc in self.bot_procs:
