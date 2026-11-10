@@ -1,14 +1,14 @@
 @echo off
 rem One-click start for Windows: double-click this file. See README.
 rem Python 3.10+ with tkinter (python3, then py -3, then python) -> your name ->
-rem bc.py server --games 0 (you + 2 AI players, only 127.0.0.1:5040, keeps hosting for the GUI replay button) in the background ->
-rem wait until port 5040 accepts -> bc.py gui -> when the window closes, stop the server.
+rem bc.py server --games 0 (you + 2 AI players, only 127.0.0.1, keeps hosting for the GUI replay button) in the background ->
+rem wait until the port accepts -> bc.py gui -> when the window closes, stop the server.
 rem Nothing before "chcp 65001" may contain non-ASCII text.
 cd /d "%~dp0"
 setlocal EnableExtensions EnableDelayedExpansion
 chcp 65001 >nul
 set "PYTHONIOENCODING=utf-8"
-set "PORT=5040"
+set "PORT="
 set "TEAM=G00"
 set "SERVER_LOG=logs\launcher-server.txt"
 title 幾A幾B 一鍵開始
@@ -27,11 +27,26 @@ if not defined PY (
 )
 for /f "usebackq delims=" %%V in (`%PY% -c "import sys; print(sys.executable, sys.version.split()[0])"`) do echo 使用 %%V
 
-call :port_open
-if not errorlevel 1 (
-    echo 連接埠 %PORT% 已經有程式在使用，可能是上一局的伺服器還沒關。請先關掉它，或等一下再試。
+rem Port: the first free one from 5600 (5040 is the default, but Windows system services often use it).
+rem The finder is a small script file, because a one-line version needs awkward quoting in cmd.
+set "FINDER=%TEMP%\bc_find_port_%RANDOM%.py"
+> "%FINDER%" echo import socket
+>> "%FINDER%" echo for port in range(5600, 5700):
+>> "%FINDER%" echo     probe = socket.socket(); probe.settimeout(1)
+>> "%FINDER%" echo     busy = probe.connect_ex(("127.0.0.1", port)) == 0; probe.close()
+>> "%FINDER%" echo     if busy: continue
+>> "%FINDER%" echo     s = socket.socket()
+>> "%FINDER%" echo     try: s.bind(("127.0.0.1", port))
+>> "%FINDER%" echo     except OSError: continue
+>> "%FINDER%" echo     finally: s.close()
+>> "%FINDER%" echo     print(port); break
+for /f "usebackq delims=" %%N in (`%PY% "%FINDER%"`) do set "PORT=%%N"
+del "%FINDER%" >nul 2>&1
+if not defined PORT (
+    echo 5600-5699 的連接埠都被占用，找不到可用的。請關掉其他程式，或上一局的伺服器，再試。
     goto fail
 )
+echo 使用連接埠 %PORT%
 
 rem ---- 2. Name ----
 :ask_name

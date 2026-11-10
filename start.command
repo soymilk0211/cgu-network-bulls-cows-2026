@@ -4,13 +4,13 @@
 # 1. 找一個有 tkinter 的 Python 3.10+（先試 python3，再試 python3.13 … python3.10、python）。
 # 2. 問你的名字（直接按 Enter = Player），隊伍用 G00。
 # 3. 在背景啟動伺服器（--games 0：一局結束後繼續開著，讓視窗的「再玩一局」能重新連線）：
-#    你 + 2 個 AI，共 3 位玩家，只在本機 127.0.0.1:5040。
-# 4. 等連接埠 5040 可以連線後，打開遊戲視窗（bc.py gui）。
+#    你 + 2 個 AI，共 3 位玩家，只在本機 127.0.0.1。
+# 4. 等連接埠可以連線後，打開遊戲視窗（bc.py gui）。
 # 5. 關掉遊戲視窗後，自動停止伺服器（和它的 AI）。
 #
 # 詳見 README 的「一鍵開始」。這個檔案只呼叫 bc.py，不改它。
 
-PORT=5040
+PORT=
 TEAM=G00
 cd "$(dirname "$0")" || exit 1
 
@@ -46,10 +46,29 @@ s.settimeout(1)
 sys.exit(0 if s.connect_ex(("127.0.0.1", int(sys.argv[1]))) == 0 else 1)' "$PORT"
 }
 
-if port_open; then
-    finish 1 "連接埠 $PORT 已經有程式在使用（可能是上一局的伺服器還沒關）。
-請先關掉它，或等一下再試。"
+# 連接埠：從 5600 起找第一個沒被占用的（5040 是預設值，但 Windows 的系統服務常占用它）。
+PORT=$("$PY" -c 'import socket, sys
+for port in range(5600, 5700):
+    probe = socket.socket()
+    probe.settimeout(1)
+    busy = probe.connect_ex(("127.0.0.1", port)) == 0
+    probe.close()
+    if busy:
+        continue
+    s = socket.socket()
+    try:
+        s.bind(("127.0.0.1", port))
+    except OSError:
+        continue
+    finally:
+        s.close()
+    print(port)
+    break
+')
+if [ -z "$PORT" ]; then
+    finish 1 "5600–5699 的連接埠都被占用，找不到可用的。請關掉其他程式（或上一局的伺服器）再試。"
 fi
+echo "使用連接埠 $PORT"
 
 # ---- 2. Name ----------------------------------------------------------------
 while :; do

@@ -19,9 +19,10 @@ Everything is in one file, `bc.py`, which uses only the Python standard library 
 1. **找 Python**：要 3.10 以上、而且有 tkinter。macOS 依序試 `python3`、`python3.13` … `python3.10`、`python`；
    Windows 依序試 `python3`、`py -3`、`python`。
 2. **問你的名字**：1–20 個字，直接按 Enter 就用 `Player`；隊伍固定是 `G00`。
-3. **在背景啟動伺服器**：`bc.py server --host 127.0.0.1 --port 5040 --players 3 --bots 2 --games 0`。只開在本機
+3. **在背景啟動伺服器**：`bc.py server --host 127.0.0.1 --port 連接埠 --players 3 --bots 2 --games 0`。連接埠是**從 5600 起第一個沒被占用的**
+   （5040 只是規格書的預設值，Windows 的系統服務常占用它；`--port` 本來就可以改）。只開在本機
    127.0.0.1，所以防火牆不會跳出詢問，別台電腦也連不進來。
-4. **等連接埠 5040 可以連線**，再打開遊戲視窗：`bc.py gui --host 127.0.0.1 --port 5040 --name 你的名字 --team G00`。
+4. **等連接埠可以連線**，再打開遊戲視窗：`bc.py gui --host 127.0.0.1 --port 連接埠 --name 你的名字 --team G00`。
    視窗怎麼玩，請看下面的「Window (GUI, optional)」。
 5. **關掉遊戲視窗後**，自動停止伺服器和它的 2 個 AI。
 
@@ -41,7 +42,7 @@ Everything is in one file, `bc.py`, which uses only the Python standard library 
 
 **常見問題**
 
-- 「連接埠 5040 已經有程式在使用」：上一局的伺服器可能還在跑，或別的程式佔用了 5040。關掉它，或等一下再試。
+- 「5600–5699 的連接埠都被占用」：很少見；通常是上一局的伺服器還在跑。關掉它再試。
 - 「找不到含 tkinter 的 Python」：照上面安裝官方 Python（Linux：`sudo apt install python3-tk`）。
 - 遊戲中途關掉視窗，會先問你是否確定，因為中途離開會被判定棄權（FORFEIT）。
 - 課堂評分用的仍是文字版 `bc.py client`；要連別人的伺服器，請照下面的 Usage 執行 `client` 或 `gui`。
