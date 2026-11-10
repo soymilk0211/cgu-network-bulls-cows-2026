@@ -83,6 +83,12 @@ What the window shows and does:
   - **feedback:** the honest answer is prefilled. If you change it, you must confirm the different answer
     first, because a wrong one leads to DQ at the reveal.
   - Input is checked in the window before anything is sent. A late answer to a closed question is never sent.
+- **再玩一局:** after `GAME_OVER` the server closes every connection (BC/1.0), so the window shows a 再玩一局
+  button. It resets the history, players, secret, status and out marks, then opens a **new** TCP connection
+  to the same host, port, name and team and sends `HELLO` again. If the server refused or is gone, the
+  window stays open with a Chinese error message and the same button retries. The server must keep
+  hosting: start it with `--games 0`, for example `python bc.py server --players 3 --bots 2 --games 0`. Its
+  bots are collected after every game and started again for the next one.
 - **Reveal** is automatic, as in the console client. The **訊息** box shows the same lines the console client
   prints. Chat and **離開遊戲** are at the bottom. Leaving during a game asks first, because it counts as a
   disconnect (FORFEIT).
