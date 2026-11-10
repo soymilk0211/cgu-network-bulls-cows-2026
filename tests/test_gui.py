@@ -230,6 +230,79 @@ class GuiSessionTest(unittest.TestCase):
         self.assertEqual(self.next_ui("done")[1], 1)
 
 
+class PlayAgainHelperTests(unittest.TestCase):
+    def test_fresh_state_is_clean_and_not_shared(self):
+        a, b = bc.fresh_gui_state(), bc.fresh_gui_state()
+        self.assertEqual(a, {"out_status": {}, "result": None, "closing": None, "last_problem": None,
+                             "rejoining": False, "prompt": None})
+        a["out_status"]["p2"] = "DQ"
+        self.assertEqual(b["out_status"], {})  # every reset gets its own dict
+
+    def test_rejoin_error_is_chinese_and_mentions_games_0(self):
+        text = bc.rejoin_error_text("127.0.0.1:5040", "[server error] GAME_IN_PROGRESS: x (fatal)")
+        for word in ("127.0.0.1:5040", "再玩一局", "--games 0", "GAME_IN_PROGRESS"):
+            self.assertIn(word, text)
+        self.assertNotIn("伺服器回應", bc.rejoin_error_text("h:1", None))
+
+
+class PlayAgainSessionTest(unittest.TestCase):
+    """next_game(): a second whole game with a NEW connection (headless, scripted server)."""
+
+    def setUp(self):
+        self.server = FakeServer()
+        self.addCleanup(self.server.close)
+        self.log_dir = tempfile.mkdtemp(prefix="bc-gui-test-")
+        self.addCleanup(shutil.rmtree, self.log_dir, True)
+
+    def wait_done(self, session):
+        self.texts = []
+        end = time.monotonic() + 5
+        while time.monotonic() < end:
+            try:
+                event = session.ui_events.get(timeout=0.05)
+            except queue.Empty:
+                continue
+            if event[0] == "text":
+                self.texts.append(event[1])
+            if event[0] == "done":
+                return event[1]
+        raise AssertionError("session did not end")
+
+    def play_one(self, session):
+        """Join, then end the game at once with GAME_OVER (the server then closes)."""
+        session.start()
+        self.server.accept()
+        self.assertEqual(self.server.expect("HELLO")["name"], "G00-測試")
+        self.server.send({"type": "WELCOME", "protocol": "BC/1.0", "player_id": "p1"},
+                         {"type": "GAME_OVER", "game_id": "g", "reason": "ABORTED", "turns": 0, "ranking": []})
+        self.assertEqual(self.wait_done(session), 0)
+        self.server.conn.close()
+
+    def test_next_game_is_a_fresh_connection_with_the_same_identity(self):
+        first = bc.GuiSession("127.0.0.1", self.server.port, "G00-測試", "G00", log_dir=self.log_dir)
+        self.play_one(first)
+        self.assertTrue(first.game_over)
+        second = first.next_game()
+        self.assertIsNot(second, first)
+        self.assertEqual((second.host, second.port, second.name, second.team, second.log_dir),
+                         (first.host, first.port, first.name, first.team, first.log_dir))
+        self.assertFalse(second.game_over)  # no state carried over
+        self.assertEqual((second.me, second.history, second.cands, second.secret), (None, {}, {}, None))
+        self.play_one(second)  # HELLO again, WELCOME again, GAME_OVER again
+        self.assertTrue(second.game_over)
+
+    def test_unreachable_server_ends_with_exit_1_and_can_be_retried(self):
+        port = self.server.port
+        self.server.close()  # nobody listens any more
+        session = bc.GuiSession("127.0.0.1", port, "G00-測試", "G00", log_dir=self.log_dir)
+        session.start()
+        self.assertEqual(self.wait_done(session), 1)
+        self.assertTrue(any(t.startswith("Cannot connect") for t in self.texts), self.texts)
+        retry = session.next_game()  # a retry is just another new session
+        retry.start()
+        self.assertEqual(self.wait_done(retry), 1)
+
+
 def make_root():
     """A Tk root window, or None if tkinter or a display is missing."""
     try:
@@ -290,6 +363,48 @@ class WindowTests(unittest.TestCase):
         self.assertEqual(app.result, 0)
         self.assertEqual(app.quit_button.cget("text"), "關閉視窗")
         self.assertEqual(len(app.players_view.get_children()), 2)
+
+
+    def test_play_again_resets_the_window_and_uses_a_new_session(self):
+        app, old = self.app, self.session
+        self.feed(("msg", {"type": "WELCOME", "player_id": "p1", "protocol": "BC/1.0"}, SNAPSHOT),
+                  ("msg", {"type": "TURN_RESULT", "turn_id": 1, "guesser": "p2", "guess": "0273", "skipped": False,
+                           "results": [{"player": "p1", "a": 3, "b": 0}], "eliminated": ["p2"], "forfeited": [],
+                           "disqualified": []}, SNAPSHOT),
+                  ("done", 0))
+        self.assertTrue(app.again_button.winfo_ismapped() or app.again_button.winfo_manager())
+        self.assertEqual(app.out_status, {"p2": "GUESSED"})
+        started = []
+        with mock.patch.object(bc.GuiSession, "start", lambda self: started.append(self)):
+            app.play_again()
+        self.assertIsNot(app.session, old)
+        self.assertEqual(started, [app.session])
+        self.assertEqual((app.out_status, app.result, app.rejoining), ({}, None, True))
+        self.assertEqual(app.history_view.get_children(), ())
+        self.assertEqual(app.players_view.get_children(), ())
+        self.assertIn("尚未選擇", app.secret_var.get())
+        self.assertIn("重新加入", app.status_var.get())
+        self.assertFalse(app.again_button.winfo_manager())  # hidden while connecting
+        self.addCleanup(app.session.close)
+        app.play_again()  # ignored while connected / connecting
+        self.assertEqual(started, [app.session])
+
+    def test_failed_rejoin_keeps_the_window_and_allows_retry(self):
+        app = self.app
+        self.feed(("done", 0))
+        shown = []
+        app.messagebox = mock.Mock(showerror=lambda *a, **k: shown.append(a))
+        with mock.patch.object(bc.GuiSession, "start", lambda self: None):
+            app.play_again()
+        self.addCleanup(app.session.close)
+        for event in (("text", "Cannot connect to 127.0.0.1:5040: refused"), ("done", 1)):
+            app.session.ui_events.put(event)  # from the NEW session
+        app.poll()
+        self.assertEqual(len(shown), 1)
+        self.assertIn("再玩一局", shown[0][1])
+        self.assertFalse(app.rejoining)
+        self.assertTrue(app.again_button.winfo_manager())  # retry is possible
+        self.assertEqual(app.result, 1)
 
 
 if __name__ == "__main__":

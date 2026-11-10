@@ -1942,6 +1942,23 @@ GUI_REASON = {"LAST_PLAYER": "只剩一位玩家", "MAX_TURNS": "達到回合上
 GUI_VERDICT = {"OK": "通過", "BAD_COMMIT": "承諾不符", "INCONSISTENT": "回報不一致", "NO_REVEAL": "未揭示"}
 
 
+def fresh_gui_state():
+    """The per-game state of the window, as it is before a game (also used for 再玩一局)."""
+    return {"out_status": {},  # player_id -> GUI_STATUS key, once that player is out
+            "result": None,  # the session's exit code once it ended
+            "closing": None,  # time.monotonic() when the user asked to quit
+            "last_problem": None,  # last server error / network line, for the dialog
+            "rejoining": False,  # a new connection was started by 再玩一局 and is not welcomed yet
+            "prompt": None}  # (seq, Prompt) shown in the action panel
+
+
+def rejoin_error_text(peer, problem):
+    """Traditional Chinese message when 再玩一局 could not join again."""
+    detail = f"\n\n伺服器回應：{problem}" if problem else ""
+    return (f"無法重新加入 {peer} 的大廳。伺服器可能已經關閉、還沒準備好下一局，或拒絕了連線。"
+            f"請確認伺服器還在執行（要連續開局請用 --games 0），稍等幾秒後再按「再玩一局」重試。{detail}")
+
+
 def feedback_text(a, b):
     """(1, 2) -> '1A2B'."""
     return f"{a}A{b}B"
@@ -2056,6 +2073,7 @@ class GuiSession(HumanClient):
 
     def __init__(self, host, port, name, team, log_dir=CLIENT_LOG_DIR):
         self.ui_events = queue.Queue()
+        self.log_dir = log_dir
         self.prompt_seq = 0  # number of the last question sent to the window
         self.shown = False  # the window shows a question
         super().__init__(host, port, name, team, out=lambda text: self.ui_events.put(("text", text)),
@@ -2073,6 +2091,13 @@ class GuiSession(HumanClient):
 
     def start_input(self):
         """No keyboard thread: the answers come from the window."""
+
+    def next_game(self):
+        """A brand-new session (new TCP connection, state and log file) for the same server and player.
+
+        The server closes every connection after GAME_OVER (BC/1.0), so playing again means a new HELLO.
+        """
+        return GuiSession(self.host, self.port, self.name, self.team, log_dir=self.log_dir)
 
     def snapshot(self):
         """A copy of the public state for the window, which never reads ours directly."""
@@ -2117,12 +2142,8 @@ class GuiApp:
         self.root, self.session = root, session
         self.tk, self.ttk, self.messagebox = tk, ttk, messagebox
         self.snapshot = session.snapshot()
-        self.prompt = None  # (seq, Prompt) shown in the action panel
         self.buttons = []
-        self.out_status = {}  # player_id -> GUI_STATUS key, once that player is out
-        self.result = None  # the session's exit code once it ended
-        self.closing = None  # time.monotonic() when the user asked to quit
-        self.last_problem = None  # last server error / network message, for the final dialog
+        self.__dict__.update(fresh_gui_state())  # prompt, out_status, result, closing, ...
         root.title(f"幾A幾B 連線對戰（BC/1.0）－ {session.name}")
         root.geometry("1040x760")
         root.minsize(760, 560)
@@ -2213,8 +2234,11 @@ class GuiApp:
         self.chat_entry.bind("<Return>", lambda e: self.send_chat())
         self.chat_button = ttk.Button(bottom, text="送出聊天", command=self.send_chat)
         self.chat_button.grid(row=0, column=2, padx=6)
+        self.again_button = ttk.Button(bottom, text="再玩一局", command=self.play_again)
+        self.again_button.grid(row=0, column=3, padx=(0, 6))
+        self.again_button.grid_remove()  # only shown when the connection has ended
         self.quit_button = ttk.Button(bottom, text="離開遊戲", command=self.on_close)
-        self.quit_button.grid(row=0, column=3)
+        self.quit_button.grid(row=0, column=4)
 
     def table(self, parent, columns):
         parent.columnconfigure(0, weight=1)
@@ -2265,6 +2289,7 @@ class GuiApp:
         try:
             mtype = msg.get("type")
             if mtype == "WELCOME":
+                self.rejoining = False
                 self.conn_var.set(f"伺服器 {self.session.peer}：已連線")
                 self.me_var.set(f"玩家：{self.session.name}（{printable(s['me'], 20)}，隊伍 {self.session.team}）")
                 self.status_var.set("已進入大廳，等待其他玩家加入")
@@ -2431,12 +2456,45 @@ class GuiApp:
         self.chat_button.state(["disabled"])
         self.quit_button.configure(text="關閉視窗")
         self.action_title.configure(text="連線已結束")
-        self.action_hint.configure(text="可以關閉視窗了。完整紀錄在訊息區與 client_logs/ 的日誌檔。")
-        if code == 0 or self.closing is not None:
+        if self.closing is not None:
+            self.action_hint.configure(text="可以關閉視窗了。完整紀錄在訊息區與 client_logs/ 的日誌檔。")
             return
-        self.status_var.set("連線中斷：" + (self.last_problem or "與伺服器的連線已結束"))
-        self.messagebox.showerror("連線結束", self.last_problem or "與伺服器的連線已結束，詳見訊息區。",
-                                  parent=self.root)
+        self.again_button.state(["!disabled"])
+        self.again_button.grid()
+        self.action_hint.configure(text="可以按「再玩一局」重新加入同一個伺服器的大廳，或關閉視窗。"
+                                        "完整紀錄在訊息區與 client_logs/ 的日誌檔。")
+        if self.rejoining:  # 再玩一局 failed: the window stays open and the button retries
+            self.rejoining = False
+            message = rejoin_error_text(self.session.peer, self.last_problem)
+            self.status_var.set("無法重新加入大廳：請稍後再按「再玩一局」")
+            self.messagebox.showerror("無法再玩一局", message, parent=self.root)
+        elif code != 0:
+            self.status_var.set("連線中斷：" + (self.last_problem or "與伺服器的連線已結束"))
+            self.messagebox.showerror("連線結束", self.last_problem or "與伺服器的連線已結束，詳見訊息區。",
+                                      parent=self.root)
+
+    def play_again(self):
+        """再玩一局: reset the per-game state, then join the lobby again with a NEW connection."""
+        if self.result is None or self.closing is not None:
+            return  # still connected, or leaving
+        self.session = self.session.next_game()
+        self.__dict__.update(fresh_gui_state())
+        self.rejoining = True
+        self.again_button.state(["disabled"])
+        self.again_button.grid_remove()
+        self.chat_entry.state(["!disabled"])
+        self.chat_button.state(["!disabled"])
+        self.quit_button.configure(text="離開遊戲")
+        for view in (self.history_view, self.players_view):
+            view.delete(*view.get_children())
+        self.snapshot = self.session.snapshot()
+        self.conn_var.set(f"伺服器 {self.session.peer}：連線中…")
+        self.me_var.set(f"玩家：{self.session.name}（隊伍 {self.session.team}）")
+        self.secret_var.set("你的秘密：尚未選擇")
+        self.status_var.set("正在重新加入大廳…")
+        self.add_text("--------- 再玩一局：重新連線 ---------")
+        self.show_prompt(None)
+        self.session.start()
 
 
 def run_gui(args):
@@ -2462,7 +2520,7 @@ def run_gui(args):
     try:
         root.mainloop()
     except KeyboardInterrupt:  # Ctrl+C in the terminal that started the window
-        session.events.put(("input", "/quit"))
+        app.session.events.put(("input", "/quit"))
         time.sleep(0.3)  # give the network thread a moment to send BYE
     return 1 if app.result is None else app.result
 
