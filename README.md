@@ -4,6 +4,48 @@ CGU 網路應用軟體設計：多人幾A幾B連線對戰系統（2026）
 Multiplayer Bulls & Cows (幾A幾B) over TCP, protocol **BC/1.0**.
 Everything is in one file, `bc.py`, which uses only the Python standard library (Python 3.10+).
 
+## 一鍵開始
+
+不想打指令？雙擊啟動檔，就會在自己的電腦上開一局：**你 + 2 個 AI**，共 3 位玩家。
+
+| 系統 | 怎麼做 |
+|---|---|
+| macOS | 在 Finder 雙擊 `start.command`（會打開一個「終端機」視窗） |
+| Windows | 雙擊 `start.bat`（會打開一個命令提示字元視窗） |
+| Linux | 在終端機執行 `bash start.command`（同一個腳本；Ubuntu/Debian 需先 `sudo apt install python3-tk`） |
+
+啟動檔會依序：
+
+1. **找 Python**：要 3.10 以上、而且有 tkinter。macOS 依序試 `python3`、`python3.13` … `python3.10`、`python`；
+   Windows 依序試 `python3`、`py -3`、`python`。
+2. **問你的名字**：1–20 個字，直接按 Enter 就用 `Player`；隊伍固定是 `G00`。
+3. **在背景啟動伺服器**：`bc.py server --host 127.0.0.1 --port 5040 --players 3 --bots 2 --games 0`。只開在本機
+   127.0.0.1，所以防火牆不會跳出詢問，別台電腦也連不進來。
+4. **等連接埠 5040 可以連線**，再打開遊戲視窗：`bc.py gui --host 127.0.0.1 --port 5040 --name 你的名字 --team G00`。
+   視窗怎麼玩，請看下面的「Window (GUI, optional)」。
+5. **關掉遊戲視窗後**，自動停止伺服器和它的 2 個 AI。
+
+`--games 0` 讓伺服器一局結束後繼續開著：打完一局（`GAME_OVER`）後，視窗的「再玩一局」按鈕會重新連到同一個大廳；
+關掉視窗才會停止伺服器。伺服器的畫面輸出存在 `logs/launcher-server.txt`，對局日誌在
+`logs/`，你的日誌在 `client_logs/`，這些都不會進 git。啟動檔只是執行 `bc.py` 的指令，沒有改動 `bc.py`。
+
+**第一次使用**
+
+- 需要含 tkinter 的 Python 3.10 以上。最簡單的方法是到 <https://www.python.org/downloads/> 下載官方安裝檔（已含
+  tkinter）；Windows 安裝時要勾選「Add python.exe to PATH」。macOS 用 Homebrew 的人，另外執行
+  `brew install python-tk`。
+- macOS 說「無法打開，因為它來自未識別的開發者」（通常是下載 ZIP 時才會）：在 Finder 對 `start.command` 按右鍵 →
+  「打開」；較新的 macOS 要到「系統設定 → 隱私權與安全性」按「強制打開」。也可以在終端機切到專案資料夾，執行
+  `bash start.command`。如果說沒有執行權限，執行 `chmod +x start.command`。
+- Windows 跳出「Windows 已保護您的電腦」或安全性警告：按「其他資訊」→「仍要執行」。
+
+**常見問題**
+
+- 「連接埠 5040 已經有程式在使用」：上一局的伺服器可能還在跑，或別的程式佔用了 5040。關掉它，或等一下再試。
+- 「找不到含 tkinter 的 Python」：照上面安裝官方 Python（Linux：`sudo apt install python3-tk`）。
+- 遊戲中途關掉視窗，會先問你是否確定，因為中途離開會被判定棄權（FORFEIT）。
+- 課堂評分用的仍是文字版 `bc.py client`；要連別人的伺服器，請照下面的 Usage 執行 `client` 或 `gui`。
+
 ## Usage
 
 ```
@@ -156,6 +198,7 @@ below 2 s.
 ```
 python bc.py server --port 5040 --players 4 --bots 1          # 4 players, 1 of them our AI
 python bc.py server --players 2 --bots 2 --log-dir logs       # hosts one AI-only game and exits
+python bc.py server --players 3 --bots 2 --games 0            # keeps hosting game after game (needed for the GUI 再玩一局)
 ```
 
 - **Lobby:** the server listens on `--host` (default `0.0.0.0`, all IPv4 addresses) and waits for `--players`
